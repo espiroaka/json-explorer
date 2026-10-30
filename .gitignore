@@ -1,0 +1,4 @@
+/target
+*.jindex
+*.jindex-wal
+*.jindex-shm

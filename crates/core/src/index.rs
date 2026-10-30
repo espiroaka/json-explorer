@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 
 use crate::parser::{CHUNK, MemberIdx, RootScanner, object_members};
 use crate::text::fold;
 
-pub const FORMAT_VERSION: i64 = 2;
+pub const FORMAT_VERSION: i64 = 4;
 pub const MAX_STORED_NESTED: usize = 4096;
 
 pub const T_STRING: i64 = 0;
@@ -56,11 +57,21 @@ pub struct IndexOptions {
     pub force: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Ingest,
+    Fts,
+    Indexes,
+}
+
 pub struct Progress {
+    pub phase: Phase,
     pub objects: u64,
     pub bytes: u64,
     pub total_bytes: u64,
     pub elapsed: f64,
+    pub step: u32,
+    pub steps: u32,
 }
 
 pub struct Summary {
@@ -128,6 +139,10 @@ fn configure(conn: &Connection) -> Result<()> {
 pub fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("no puedo abrir el índice {}", path.display()))?;
+    let empty: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+    if empty == 0 {
+        conn.pragma_update(None, "page_size", 16384_i64)?;
+    }
     conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))?;
     configure(&conn)?;
     Ok(conn)
@@ -153,6 +168,11 @@ pub fn open_db_ro(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
+    init_tables(conn)?;
+    init_indexes(conn)
+}
+
+fn init_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta(
              key TEXT PRIMARY KEY,
@@ -171,8 +191,6 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
              byte_length INTEGER NOT NULL
          ) WITHOUT ROWID;
 
-         CREATE INDEX IF NOT EXISTS idx_objects_key ON objects(root_key);
-
          CREATE TABLE IF NOT EXISTS props(
              object_id INTEGER NOT NULL,
              path_id INTEGER NOT NULL,
@@ -181,11 +199,15 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
              num REAL,
              norm TEXT NOT NULL,
              PRIMARY KEY(object_id, path_id)
-         ) WITHOUT ROWID;
+         ) WITHOUT ROWID;",
+    )?;
+    Ok(())
+}
 
-         CREATE INDEX IF NOT EXISTS idx_props_lookup ON props(path_id, value);
-         CREATE INDEX IF NOT EXISTS idx_props_norm ON props(path_id, norm);
-         CREATE INDEX IF NOT EXISTS idx_props_num ON props(path_id, num) WHERE num IS NOT NULL;",
+fn init_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_objects_key ON objects(root_key);
+         CREATE INDEX IF NOT EXISTS idx_props_search ON props(path_id, norm, object_id) WHERE type IN (0,1,2,3);",
     )?;
     Ok(())
 }
@@ -196,7 +218,8 @@ fn init_fts(conn: &Connection) -> Result<()> {
              text,
              path_id UNINDEXED,
              object_id UNINDEXED,
-             tokenize='trigram'
+             tokenize='trigram',
+             detail=none
          );",
     )
     .context("no puedo crear el índice FTS5 (trigram); usa --force sin --fts")?;
@@ -211,7 +234,7 @@ fn reset(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS paths;
          DROP TABLE IF EXISTS meta;",
     )?;
-    init_schema(conn)
+    init_tables(conn)
 }
 
 fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -333,13 +356,13 @@ fn path_id(conn: &Connection, cache: &mut HashMap<String, i64>, path: &str) -> R
     if let Some(&id) = cache.get(path) {
         return Ok(id);
     }
-    let id: i64 = conn.query_row(
-        "INSERT INTO paths(path) VALUES(?1)
-         ON CONFLICT(path) DO UPDATE SET path=excluded.path
-         RETURNING id",
-        [path],
-        |r| r.get(0),
-    )?;
+    let id: i64 = conn
+        .prepare_cached(
+            "INSERT INTO paths(path) VALUES(?1)
+             ON CONFLICT(path) DO UPDATE SET path=excluded.path
+             RETURNING id",
+        )?
+        .query_row([path], |r| r.get(0))?;
     cache.insert(path.to_string(), id);
     Ok(id)
 }
@@ -417,7 +440,7 @@ pub fn build_index(
     }
     if !opts.all && opts.select.is_empty() {
         bail!(
-            "no has indicado ninguna propiedad. Ejecuta `jexplorer props <fichero>` y pasa --select, o usa --all"
+            "no has indicado ninguna propiedad; abre el JSON en el shell, consulta `props` y usa `index --select PROP`, o `index --all`"
         );
     }
     if opts.batch == 0 {
@@ -428,7 +451,9 @@ pub fn build_index(
     let (size, fp, mtime) = fingerprint(json)?;
 
     let mut conn = open_db(db)?;
-    init_schema(&conn)?;
+    // Fewer WAL checkpoints during a bulk build; one TRUNCATE at the end.
+    conn.pragma_update(None, "wal_autocheckpoint", 10_000_i64)?;
+    init_tables(&conn)?;
 
     let mut resume_offset = 0u64;
     let mut next_id = 0i64;
@@ -471,37 +496,42 @@ pub fn build_index(
             if st.status != "running" {
                 bail!("el índice está en un estado inesperado: {}", st.status);
             }
-            resume_offset = st.resume_offset;
             next_id = st.next_id;
             objects = st.objects;
+            if next_id > 0 {
+                let (offset, length) = object_span(&conn, next_id - 1)?;
+                resume_offset = offset + length;
+            }
         }
     }
 
     if resume_offset == 0 {
-        put_meta(&conn, "format", &FORMAT_VERSION.to_string())?;
-        put_meta(&conn, "json_path", &abs_json_str)?;
-        put_meta(&conn, "size", &size.to_string())?;
-        put_meta(&conn, "fingerprint", &fp.to_string())?;
-        put_meta(&conn, "mtime", &mtime.to_string())?;
-        put_meta(&conn, "props", &serde_json::to_string(&opts.select)?)?;
-        put_meta(&conn, "all", if opts.all { "1" } else { "0" })?;
-        put_meta(&conn, "fts", if opts.fts { "1" } else { "0" })?;
-        put_meta(&conn, "status", "running")?;
-        put_meta(&conn, "resume_offset", "0")?;
-        put_meta(&conn, "next_id", "0")?;
-        put_meta(&conn, "objects", "0")?;
+        let tx = conn.transaction()?;
+        put_meta(&tx, "format", &FORMAT_VERSION.to_string())?;
+        put_meta(&tx, "json_path", &abs_json_str)?;
+        put_meta(&tx, "size", &size.to_string())?;
+        put_meta(&tx, "fingerprint", &fp.to_string())?;
+        put_meta(&tx, "mtime", &mtime.to_string())?;
+        put_meta(&tx, "props", &serde_json::to_string(&opts.select)?)?;
+        put_meta(&tx, "all", if opts.all { "1" } else { "0" })?;
+        put_meta(&tx, "fts", if opts.fts { "1" } else { "0" })?;
+        put_meta(&tx, "status", "running")?;
+        put_meta(&tx, "resume_offset", "0")?;
+        put_meta(&tx, "next_id", "0")?;
+        put_meta(&tx, "objects", "0")?;
+        put_meta(&tx, "fts_done", "0")?;
+        tx.commit()?;
     }
     if opts.fts {
         init_fts(&conn)?;
     }
 
     let selected: HashSet<&str> = opts.select.iter().map(String::as_str).collect();
-    let mut seen: HashMap<String, u64> = if opts.all {
-        HashMap::new()
-    } else {
-        opts.select.iter().map(|s| (s.clone(), 0u64)).collect()
+    let mut path_ids: HashMap<String, i64> = {
+        let mut stmt = conn.prepare("SELECT path,id FROM paths")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
     };
-    let mut path_ids: HashMap<String, i64> = HashMap::new();
     let mut members: Vec<MemberIdx> = Vec::new();
 
     let mut scanner = RootScanner::open(&abs_json, resume_offset)?;
@@ -510,6 +540,23 @@ pub fn build_index(
     let mut oversized = 0u64;
     let t0 = Instant::now();
     let mut finished = false;
+    const PROP_CHUNK: usize = 100;
+    let prop_chunk_sql = format!(
+        "INSERT OR REPLACE INTO props(object_id,path_id,type,value,num,norm) VALUES {}",
+        (0..PROP_CHUNK)
+            .map(|_| "(?,?,?,?,?,?)")
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    progress(&Progress {
+        phase: Phase::Ingest,
+        objects,
+        bytes: resume_offset,
+        total_bytes: size,
+        elapsed: 0.0,
+        step: 0,
+        steps: 0,
+    });
 
     while !finished {
         let tx = conn.transaction()?;
@@ -517,15 +564,12 @@ pub fn build_index(
             let mut ins_obj = tx.prepare_cached(
                 "INSERT INTO objects(id,root_key,byte_offset,byte_length) VALUES(?1,?2,?3,?4)",
             )?;
-            let mut ins_prop = tx.prepare_cached(
+            let mut ins_prop = tx.prepare_cached(&prop_chunk_sql)?;
+            let mut ins_prop_one = tx.prepare_cached(
                 "INSERT OR REPLACE INTO props(object_id,path_id,type,value,num,norm)
                  VALUES(?1,?2,?3,?4,?5,?6)",
             )?;
-            let mut ins_fts = if opts.fts {
-                Some(tx.prepare_cached("INSERT INTO fts(text,path_id,object_id) VALUES(?1,?2,?3)")?)
-            } else {
-                None
-            };
+            let mut prop_rows: Vec<SqlValue> = Vec::with_capacity(PROP_CHUNK * 6);
 
             for _ in 0..opts.batch {
                 let span = match scanner.next_into(&mut key)? {
@@ -566,23 +610,15 @@ pub fn build_index(
                                 let num = numeric_value(raw, ty);
                                 let norm = fold(&val);
                                 let pid = path_id(&tx, &mut path_ids, k.as_ref())?;
-                                ins_prop.execute(params![
-                                    id,
-                                    pid,
-                                    ty,
-                                    val.as_str(),
-                                    num,
-                                    norm.as_str()
-                                ])?;
-                                if let Some(fts) = ins_fts.as_mut() {
-                                    if ty == T_STRING {
-                                        fts.execute(params![norm.as_str(), pid, id])?;
-                                    }
-                                }
-                                if let Some(c) = seen.get_mut(k.as_ref()) {
-                                    *c += 1;
-                                } else {
-                                    seen.insert(k.into_owned(), 1);
+                                prop_rows.push(SqlValue::Integer(id));
+                                prop_rows.push(SqlValue::Integer(pid));
+                                prop_rows.push(SqlValue::Integer(ty));
+                                prop_rows.push(SqlValue::Text(val));
+                                prop_rows.push(num.map(SqlValue::Real).unwrap_or(SqlValue::Null));
+                                prop_rows.push(SqlValue::Text(norm));
+                                if prop_rows.len() == PROP_CHUNK * 6 {
+                                    ins_prop.execute(params_from_iter(prop_rows.iter()))?;
+                                    prop_rows.clear();
                                 }
                             }
                         }
@@ -590,30 +626,116 @@ pub fn build_index(
                     }
                 }
                 objects += 1;
+                resume_offset = span.end();
+            }
+            for row in prop_rows.chunks_exact(6) {
+                ins_prop_one.execute(params_from_iter(row.iter()))?;
             }
         }
 
         let pos = scanner.position();
-        put_meta(&tx, "resume_offset", &pos.to_string())?;
+        put_meta(&tx, "resume_offset", &resume_offset.to_string())?;
         put_meta(&tx, "next_id", &next_id.to_string())?;
         put_meta(&tx, "objects", &objects.to_string())?;
         tx.commit()?;
 
         progress(&Progress {
+            phase: Phase::Ingest,
             objects,
             bytes: pos,
             total_bytes: size,
             elapsed: t0.elapsed().as_secs_f64(),
+            step: 0,
+            steps: 0,
         });
     }
 
-    put_meta(&conn, "status", "complete")?;
-    put_meta(&conn, "resume_offset", &scanner.position().to_string())?;
-    put_meta(&conn, "objects", &objects.to_string())?;
-    conn.execute_batch("ANALYZE; PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")?;
+    if opts.fts && !flag(&conn, "fts_done")? {
+        let batch_objects: i64 = 50_000;
+        let steps = ((objects as i64 + batch_objects - 1) / batch_objects).max(1) as u32;
+        conn.execute_batch("DELETE FROM fts;")?;
+        progress(&Progress {
+            phase: Phase::Fts,
+            objects,
+            bytes: 0,
+            total_bytes: size,
+            elapsed: t0.elapsed().as_secs_f64(),
+            step: 0,
+            steps,
+        });
+        let mut step = 0u32;
+        let mut start = 0i64;
+        while start < objects as i64 {
+            let end = (start + batch_objects).min(objects as i64);
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO fts(text,path_id,object_id)
+                 SELECT norm,path_id,object_id FROM props
+                 WHERE type=?1 AND object_id>=?2 AND object_id<?3",
+                params![T_STRING, start, end],
+            )?;
+            tx.commit()?;
+            step += 1;
+            progress(&Progress {
+                phase: Phase::Fts,
+                objects,
+                bytes: end as u64,
+                total_bytes: size,
+                elapsed: t0.elapsed().as_secs_f64(),
+                step,
+                steps,
+            });
+            start = end;
+        }
+        let tx = conn.transaction()?;
+        put_meta(&tx, "fts_done", "1")?;
+        tx.commit()?;
+    }
+
+    // Bulk sorting must be able to spill to disk for large indexes.
+    conn.execute_batch("PRAGMA temp_store=FILE;")?;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8) as i64;
+    conn.pragma_update(None, "threads", threads)?;
+    let indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_props_search ON props(path_id, norm, object_id) WHERE type IN (0,1,2,3)",
+        "CREATE INDEX IF NOT EXISTS idx_objects_key ON objects(root_key)",
+    ];
+    progress(&Progress {
+        phase: Phase::Indexes,
+        objects,
+        bytes: 0,
+        total_bytes: size,
+        elapsed: t0.elapsed().as_secs_f64(),
+        step: 0,
+        steps: indexes.len() as u32,
+    });
+    for (i, sql) in indexes.iter().enumerate() {
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        tx.commit()?;
+        progress(&Progress {
+            phase: Phase::Indexes,
+            objects,
+            bytes: 0,
+            total_bytes: size,
+            elapsed: t0.elapsed().as_secs_f64(),
+            step: (i + 1) as u32,
+            steps: indexes.len() as u32,
+        });
+    }
+
+    let tx = conn.transaction()?;
+    put_meta(&tx, "status", "complete")?;
+    put_meta(&tx, "resume_offset", &scanner.position().to_string())?;
+    put_meta(&tx, "objects", &objects.to_string())?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
 
     let props: Vec<String> = if opts.all {
-        let mut names: Vec<String> = seen.keys().cloned().collect();
+        let mut names: Vec<String> = path_ids.keys().cloned().collect();
         names.sort();
         names
     } else {
@@ -624,7 +746,7 @@ pub fn build_index(
     } else {
         opts.select
             .iter()
-            .filter(|p| seen.get(p.as_str()).copied().unwrap_or(0) == 0)
+            .filter(|p| !path_ids.contains_key(p.as_str()))
             .cloned()
             .collect()
     };

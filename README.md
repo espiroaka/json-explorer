@@ -1,203 +1,213 @@
 # json-explorer
 
-Explora y busca ficheros JSON gigantes **sin cargarlos en memoria**.
+Explora JSON grandes sin cargar el documento completo en memoria. `jexplorer` es
+**exclusivamente interactivo**: abre una fuente, descubre propiedades, crea un índice
+SQLite `.jindex` y consulta los objetos leyendo sus posiciones en el JSON original.
+En una terminal muestra menús navegables con flechas; con entrada o salida
+redirigida conserva el shell textual para scripts.
+El JSON no se modifica ni se copia al indexarlo.
 
-`jexplorer` recorre el fichero una sola vez, guarda las posiciones de cada objeto en un índice
-SQLite y a partir de ahí responde búsquedas y consultas en milisegundos, incluso con cientos de
-miles de objetos. El JSON original no se modifica ni se copia: cada resultado apunta a su
-`offset` y longitud exactos dentro del fichero.
+## Interfaz con flechas
 
-```
-JSON de 250 MB  ──►  índice .jindex (SQLite)  ──►  jexplorer search / shell
-     (intacto)              (~decenas de MB)
-```
+Ejecuta `jexplorer` o `jexplorer "C:\datos\datos.json"` en CMD:
 
-## Características
+- **↑ / ↓**: elige una acción o recorre todas las coincidencias de una búsqueda.
+- **Enter / →**: abre una acción o el objeto seleccionado del JSON.
+- **← / Esc**: vuelve atrás; desde el visor conserva la página y el resultado.
+- **RePág / AvPág**: cambia de página de resultados o desplaza el visor.
+- **Inicio / Fin**: extremos de la página actual; en el visor, inicio/final del objeto.
+- En el visor, **r** alterna original/formateado y **e** exporta los bytes originales.
+- En los campos de texto, ← / → editan; Enter acepta y Esc cancela.
+- En el menú principal, Esc o `q` salen.
 
-- **Escaneo en streaming**: ventanas de 8 MB, memoria constante, sin `serde_json` para el recorrido.
-- **Índice reanudable**: si la indexación se interrumpe, continúa donde se quedó.
-- **Búsqueda avanzada**: igualdad, prefijo, contiene, rangos numéricos, nulos, existencia,
-  ausencia y expresiones regulares.
-- **Sin mayúsculas ni acentos** con `--fold` (Unicode NFD).
-- **Varios filtros** combinables con `AND` u `OR`, y `--count` para contar sin traer resultados.
-- **FTS5 opcional** (`--fts`) para búsquedas de texto rápido con tokenizador *trigram*.
-- **Salidas** en tabla, JSON, CSV y TSV, listas para `jq`, Excel o scripts.
-- **Shell interactivo** con historial, paginación, vista formateada y exportación.
-- **Verificación de integridad**: comprueba que el índice sigue coincidiendo con el fichero.
-- **Solo lectura**: las consultas abren el índice en modo `read-only` (con *fallback* seguro).
+Puedes buscar eligiendo propiedad, operador y valor, o escribir una consulta
+completa. El navegador muestra el total de coincidencias y carga **solo una página**
+de objetos cada vez; las flechas cruzan los límites de página automáticamente.
+El visor no tiene el límite de 200 líneas del shell textual y ajusta las líneas
+al ancho de la terminal.
+
+Los menús incluyen apertura, indexación, propiedades, estadísticas, valores
+frecuentes, verificación y ajustes. **Comandos del shell** conserva las operaciones
+avanzadas; indexar y verificar muestran su salida textual y esperan Enter para
+volver al menú. Rehacer un índice requiere confirmación. **Última búsqueda** vuelve
+a cargar los resultados desde la primera página.
+
+Abrir un JSON sigue sin indexarlo automáticamente. Usa **Indexar JSON** si no
+hay un índice válido. Los formatos `json`, `csv` y `tsv` afectan a los comandos
+del shell, no al navegador con flechas.
 
 ## Instalación
 
-Requisitos:
+Requiere Rust 1.87 o superior y un linker de C (Visual Studio Build Tools o MinGW
+en Windows; toolchain de C en Linux/macOS). SQLite se compila embebido.
+Desde el repositorio:
 
-- Rust **1.87 o superior** (`rustup` recomendado).
-- Un *linker* de C: Visual Studio Build Tools en Windows, o las toolchains GNU (`stable-x86_64-pc-windows-gnu`
-  con MinGW-w64). En Linux/macOS, `build-essential` / Xcode Command Line Tools.
-
-```bash
-git clone <repo> json-explorer
-cd json-explorer
+```bat
 cargo build --release
-# binario en target/release/jexplorer (jexplorer.exe en Windows)
+target\release\jexplorer.exe
 ```
 
-SQLite se compila embebido (`rusqlite/bundled`): no hace falta instalar nada aparte.
+En Linux/macOS, el binario es `target/release/jexplorer`. Los ejemplos siguientes
+suponen que `jexplorer` está en el `PATH`; también puedes usar su ruta completa.
 
-## Inicio rápido
+## Inicio rápido (CMD de Windows)
 
-El JSON de entrada debe ser un **objeto cuyas claves sean los objetos** a explorar:
+El documento debe tener un objeto raíz cuyas claves identifiquen los objetos:
 
 ```json
 {
-  "id0": { "nombre": "Antonio", "edad": 42, "ciudad": "Toledo" },
-  "id1": { "nombre": "Lucía",   "edad": 31, "ciudad": "Madrid" }
+  "a": { "nombre": "Antonio", "edad": 42, "ciudad": "Toledo", "dato": null },
+  "b": { "nombre": "MARÍA", "edad": 30, "ciudad": "Madrid" }
 }
 ```
 
-```bash
-# 1. ¿Qué propiedades hay?
-jexplorer props datos.json
+En CMD, inicia el shell vacío o abre directamente un JSON o un índice:
 
-# 2. Indexar todas las propiedades (+ FTS para texto)
-jexplorer index datos.json --all --fts
-
-# 3. Buscar
-jexplorer search --db datos.json.jindex --path ciudad --value Madrid
-jexplorer search --db datos.json.jindex --path edad --op gte --value 30
+```bat
+jexplorer
+jexplorer "C:\datos con espacios\datos.json"
+jexplorer "C:\datos con espacios\datos.json.jindex"
+jexplorer --help
+jexplorer --version
 ```
 
-El índice se crea por defecto junto al fichero: `datos.json.jindex`.
+Sin argumentos muestra el menú principal; con entrada o salida redirigida,
+un banner y el shell textual. `--help` y `--version` funcionan sin fichero. **No existen subcomandos externos**:
+`jexplorer index ...`, `jexplorer search ...`, `jexplorer shell ...` y el argumento
+externo `--db` no son la interfaz; los comandos se escriben dentro de la sesión.
 
-## Comandos
+Para escribir estos comandos en una terminal, entra en **Comandos del shell**.
+Con entrada o salida redirigida se usa directamente el shell textual:
 
-| Comando | Qué hace |
-| --- | --- |
-| `props <file> [--sample N]` | Muestra propiedades, apariciones y tipos de los primeros objetos. |
-| `index <file>` | Construye o actualiza el índice. |
-| `search` | Busca por una o varias propiedades. |
-| `get --id N \| --key CLAVE` | Muestra un objeto por id interno o por su clave raíz. |
-| `export --id N --out f.json` | Extrae un objeto tal cual a un fichero. |
-| `groupby --path PROP [--limit N]` | Agrupa valores y muestra los más frecuentes. |
-| `verify [--sample N]` | Comprueba índice contra fichero (0 = comprobar todo). |
-| `stats` | Estado, tamaño y propiedades del índice. |
-| `shell` | Sesión interactiva. |
-
-### Indexar
-
-```bash
-jexplorer index datos.json --select nombre --select ciudad
-jexplorer index datos.json --all --fts --batch 50000
-jexplorer index datos.json --force          # rehacer desde cero
-```
-
-- `--select PROP` (repetible) indexa solo esas propiedades; `--all` indexa todas las de primer nivel.
-- `--fts` añade la tabla FTS5 *trigram* (útil con `--fold` para `contains`).
-- `--batch` ajusta objetos por transacción (más alto = más rápido, más memoria).
-- Los cambios de formato del índice se resuelven con `--force`; se avisa al abrirlo.
-
-### Buscar
-
-```bash
-jexplorer search --db datos.json.jindex --path nombre --value Antonio
-jexplorer search --db datos.json.jindex --path nombre --op prefix --value Ant --fold
-jexplorer search --db datos.json.jindex --path descripcion --op contains --value "texto libre" --fold
-jexplorer search --db datos.json.jindex --path edad --op gt --value 18 --format json
-jexplorer search --db datos.json.jindex --path dato --op null
-jexplorer search --db datos.json.jindex --path telefono --op missing
-```
-
-Operadores (`--op`):
-
-| Operador | Alias | Significado |
-| --- | --- | --- |
-| `eq` | `=`, `==`, `igual` | Igualdad exacta |
-| `ne` | `!=`, `<>`, `distinto` | Distinto de |
-| `contains` | `~`, `contiene` | Contiene la subcadena |
-| `prefix` | `^`, `empieza` | Empieza por |
-| `gt` / `gte` / `lt` / `lte` | `>`, `>=`, `<`, `<=` | Rangos numéricos |
-| `exists` | `?`, `existe` | La propiedad está presente |
-| `missing` | `!?`, `falta` | La propiedad no está |
-| `null` | `nulo` | La propiedad existe y vale `null` |
-| `regex` | `~r` | Expresión regular (Rust `regex`) |
-
-Opciones útiles:
-
-- `--fold`: ignora mayúsculas y acentos en `eq`, `ne`, `contains` y `prefix`.
-- `--filter "PROP OP VALOR"` (repetible): filtros adicionales; se combinan con `AND`.
-- `--any`: combina los filtros con `OR`.
-- `--count`: devuelve solo el número de coincidencias.
-- `--limit` / `--after`: paginación estable por id interno (sirve como cursor).
-- `--format table|json|csv|tsv`.
-
-```bash
-# AND: activos mayores de 30
-jexplorer search --db datos.json.jindex \
-  --path edad --op gt --value 30 \
-  --filter "estado = activo"
-
-# OR: de Madrid o de Toledo
-jexplorer search --db datos.json.jindex \
-  --path ciudad --value Madrid \
-  --filter "ciudad = Toledo" --any --count
-```
-
-### Agrupar y verificar
-
-```bash
-jexplorer groupby --db datos.json.jindex --path ciudad --limit 10 --format csv
-jexplorer verify --db datos.json.jindex --sample 5000
-jexplorer get --db datos.json.jindex --key id42
-jexplorer export --db datos.json.jindex --key id42 --out objeto.json
-```
-
-`verify` recorre el fichero y el índice en paralelo: compara claves y *spans*, parsea una muestra
-de objetos y contrasta sus propiedades. También detecta objetos mayores de 8 MB, que se indexan
-sin propiedades.
-
-### Shell interactivo
-
-```bash
-jexplorer shell --db datos.json.jindex
-```
-
-```
+```text
+jx> abrir "C:\datos con espacios\datos.json"
+jx> props
+jx> index --fts --batch 50000
 jx> nombre = Antonio
-jx> nombre ~i ant            # contiene, sin mayúsculas ni acentos
-jx> edad >= 30               # rangos
-jx> n                        # siguiente página
-jx> ver 3                    # abrir el resultado 3 formateado
-jx> raw 3                    # verlo tal cual está en el fichero
-jx> e 3 salida.json          # exportar
-jx> key id42                 # abrir por clave raíz
-jx> top ciudad 5             # agrupar valores
-jx> props | stats | ayuda | q
+jx> nombre ~i ari
+jx> edad >= 30 & ciudad = Madrid
+jx> count ciudad = Madrid | ciudad = Toledo
+jx> limite 1
+jx> ciudad ?
+jx> n
+jx> ver 1
+jx> e 1 "C:\datos con espacios\objeto.json"
+jx> verify
+jx> q
 ```
 
-Los sufijos de operador del shell: `=i`, `~i`, `^i` (con *fold*), `>`, `>=`, `<`, `<=`, `?`,
-`!?`, `null` y `~r` (regex).
+Abrir un JSON **no lo indexa automáticamente**. Si existe su sidecar
+`datos.json.jindex`, sano y completo, se abre ese índice; en caso contrario queda
+seleccionado el JSON y se indica usar `index`. `props` permite descubrir sus
+propiedades antes de indexar. Abrir un `.jindex` inválido muestra un error y
+conserva la sesión anterior. Una apertura válida borra los resultados y la última
+consulta de la fuente anterior.
 
-## Cómo funciona
+## Comandos del shell
 
-1. **Escaneo**: el *scanner* lee el JSON en ventanas de 8 MB y localiza los miembros del objeto
-   raíz (`clave: {...}`) sin materializar el documento completo.
-2. **Índice**: para cada objeto guarda `id`, clave raíz, `byte_offset` y `byte_length`. Para las
-   propiedades seleccionadas guarda tipo, valor textual, valor numérico y valor normalizado
-   (plegado Unicode) en `props`.
-3. **Consultas**: un único filtro usa índices SQLite dedicados (`lookup`, `norm`, `num` o FTS);
-   varios filtros se resuelven con predicados `EXISTS` combinados con `AND`/`OR`.
-4. **Lectura**: `get`/`export` leen únicamente los bytes del objeto desde el JSON original.
+| Comando | Función |
+| --- | --- |
+| `abrir "FICHERO"` / `open "FICHERO"` | Selecciona un JSON o `.jindex`; las rutas de Windows conservan sus barras inversas. |
+| `props` | Sin índice, descubre propiedades en los primeros 1000 objetos; con índice, muestra rutas indexadas. |
+| `props N` | Descubre propiedades usando una muestra de N objetos del JSON. |
+| `index [OPCIONES]` | Indexa la fuente y la deja lista para buscar; por defecto, todas las propiedades. |
+| `PROP OP VALOR` / `buscar CONSULTA` | Busca; admite varios filtros con el mismo conector `&` o `\|`. |
+| `count [CONSULTA]` | Cuenta una consulta nueva o la última búsqueda sin cambiar sus hits ni su página. |
+| `n` | Siguiente página de la búsqueda activa. |
+| `limite N` | Tamaño de página entre 1 y 10000; borra hits y última búsqueda. |
+| `formato table\|json\|csv\|tsv` | Formato persistente en la sesión, sin mensaje de confirmación. |
+| `top PROP [N]` | Valores más frecuentes, en el formato seleccionado. |
+| `ver N` / `raw N` | Resultado N de la página actual, formateado o tal cual. Las posiciones empiezan en 1. |
+| `id N` / `key CLAVE` | Lee por id interno (empieza en 0) o clave raíz. |
+| `e N "FICHERO"` | Exporta los bytes exactos del resultado N, sin reformatearlos. |
+| `verify [N]` | Verifica el índice y una muestra de objetos: 1000 por defecto, 0 para todos. Éxito: `Verificación correcta.` |
+| `stats` | Estado, tamaños, modo de indexación y FTS. |
+| `ayuda` | Ayuda del shell, también sin fuente abierta. |
+| `q` | Sale. EOF también termina la sesión. |
 
-Si el JSON cambia de tamaño o *fingerprint*, el índice se considera inválido; si solo cambia la
-fecha de modificación, se avisa pero se permite consultar.
+Los errores de comandos se escriben en **stderr** y el shell continúa. EOF o `q`
+terminan con código 0 aunque hubiera errores internos; un error al abrir el
+fichero inicial termina con código 1.
+
+### Indexación
+
+Estos comandos se ejecutan **dentro del shell**:
+
+```text
+index
+index --select nombre --select ciudad
+index --all --fts --batch 50000
+index --db "C:\indices\datos.jindex"
+index --force --all --fts
+```
+
+- `--select PROP` es repetible y limita las propiedades; `--all` las incluye todas.
+- `--fts` añade FTS5 con tokenizador trigram para búsquedas de texto.
+- `--batch N` establece los objetos por transacción; debe ser positivo.
+- `--db FICHERO` elige la ruta del índice; por defecto se usa el sidecar
+  `FICHERO.json.jindex` junto al JSON. Si rehaces un índice abierto, conserva su ruta.
+- **Precaución con `--force`: rehace el índice desde cero.** Revisa su ruta y las
+  propiedades/FTS deseadas antes de usarlo. No modifica el JSON, pero sustituye
+  el índice anterior; puede ser necesario al cambiar de versión del formato.
+
+### Operadores y consultas
+
+| Operador | Significado | Ejemplo |
+| --- | --- | --- |
+| `=` / `!=` | Igualdad / distinto | `nombre = Antonio` |
+| `~` / `^` | Contiene / empieza por | `nombre ^ Ant` |
+| `=i`, `!=i`, `~i`, `^i` | Los anteriores ignorando mayúsculas y acentos | `nombre =i maria` |
+| `>`, `>=`, `<`, `<=` | Comparación numérica | `edad >= 30` |
+| `?` / `!?` | Existe / falta la propiedad | `dato !?` |
+| `null` | Existe y vale null; no equivale a ausencia | `dato null` |
+| `~r` | Expresión regular sobre el valor almacenado | `nombre ~r "^Ant(o\|ó)"` |
+
+```text
+edad > 30 & ciudad = Toledo
+ciudad = Madrid | ciudad = Toledo
+etiqueta = "rock & roll"
+ruta = "C:\datos con espacios\origen.json"
+codigo ~r "^A\d+$"
+```
+
+`&` exige que se cumplan todos los filtros; `|` acepta cualquiera.
+Una consulta puede encadenar `&` o encadenar `|`, pero **no mezclarlos**.
+Separa los conectores con espacios. Entrecomilla los valores que contengan
+`&` o `|` como texto literal. Las barras inversas son literales: no hace falta
+duplicarlas en rutas de Windows o regex escritas en el shell. Las búsquedas
+requieren propiedades indexadas.
+
+## Formatos de salida
+
+`formato` afecta a las búsquedas y a `top`, no es un subcomando ni un argumento
+externo. El banner y los mensajes de apertura/indexación siguen siendo texto;
+al procesar stdout desde scripts hay que saltarlos.
+
+- `table`: tabla del shell con posiciones de resultado, ids y vistas por `ver`.
+- `json`: búsquedas con el envelope
+  `{count,ms,next_after,hits:[{id,key,type,value,offset,length}]}`. `count` en una
+  búsqueda es el número de hits de esa página, no el total de coincidencias.
+- `csv` / `tsv`: búsquedas con columnas `id,key,type,value,offset,length`.
+- `count` imprime solo el número, salvo en JSON, donde imprime `{"count": N}`.
+- `top` respeta los cuatro formatos; en JSON devuelve un array de
+  `{"value": "...", "type": "string", "count": N}`.
+
+`offset` y `length` señalan bytes del objeto en el JSON original; `next_after`
+es el cursor de paginación por id. El JSON original debe seguir disponible para
+leer, exportar y verificar los objetos.
 
 ## Limitaciones
 
-- Solo se indexan **objetos de primer nivel** del objeto raíz; los anidados se guardan como texto
-  JSON (hasta 4 KB) y se pueden buscar con `contains`/`regex`, no con rutas anidadas.
-- Objetos mayores de **8 MB** se indexan por clave y posición, pero sin propiedades.
-- `regex` se evalúa sobre los valores almacenados, no sobre posiciones arbitrarias del fichero.
-- El índice es propio de la versión actual del formato (`FORMAT_VERSION`); tras actualizar la
-  herramienta puede ser necesario `--force`.
+- Se exploran objetos del **primer nivel** del objeto raíz y sus propiedades
+  directas, no rutas anidadas como `direccion.ciudad`.
+- Los valores anidados se almacenan como texto JSON, truncado a **4 KB**;
+  `~` y `~r` solo buscan sobre el texto almacenado.
+- Los objetos mayores de **8 MB** conservan clave y posición, pero se indexan
+  **sin propiedades**.
+- El tamaño del índice depende de los datos y opciones: **todas las propiedades
+  más FTS pueden producir un índice mayor que el JSON**.
+- Si cambia el JSON, el índice puede dejar de ser válido; verificar no actualiza
+  el índice. No se garantiza actualización incremental de un JSON modificado.
 
 ## Desarrollo
 
@@ -207,26 +217,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Estructura:
-
-- `crates/core` (`jxcore`): scanner, parser, índice SQLite y motor de búsqueda.
-- `crates/cli` (`jexplorer`): comandos, salidas y shell.
-- `scripts/gen-test-data.mjs`: genera un JSON de prueba (por defecto 300 000 objetos).
-- `scripts/verify-offsets.mjs`: verifica *offsets* y propiedades del índice contra el JSON.
-
-```bash
-node scripts/gen-test-data.mjs 300000 target/data/big.json
-target/release/jexplorer index target/data/big.json --all --fts
-node scripts/verify-offsets.mjs target/data/big.json target/data/big.json.jindex
-```
-
-## Hoja de ruta
-
-- Rutas anidadas (`direccion.ciudad`).
-- Índices incrementales cuando el JSON cambia.
-- Exportación de conjuntos de resultados completos (JSON Lines / CSV).
-- Estadísticas por propiedad (mín./máx./media) en `stats`.
-- Empaquetado multiplataforma y binarios precompilados.
+`crates/core` contiene scanner, parser, índice y búsquedas; `crates/cli` contiene
+el shell y sus pruebas de integración.
 
 ## Licencia
 

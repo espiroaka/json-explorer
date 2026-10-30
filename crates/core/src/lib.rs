@@ -5,8 +5,8 @@ pub mod search;
 pub mod text;
 
 pub use index::{
-    Freshness, Group, IndexOptions, Progress, PropInfo, Stats, Summary, VerifyReport, build_index,
-    check_source, db_path_for, discover_props, group_by, index_json_path, object_span,
+    Freshness, Group, IndexOptions, Phase, Progress, PropInfo, Stats, Summary, VerifyReport,
+    build_index, check_source, db_path_for, discover_props, group_by, index_json_path, object_span,
     object_span_by_key, open_checked, open_db, open_db_ro, stats, type_name, verify,
 };
 pub use reader::{pretty, read_object};

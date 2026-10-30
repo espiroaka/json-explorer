@@ -188,8 +188,16 @@ fn has_fts(conn: &Connection) -> Result<bool> {
         .is_some())
 }
 
-fn fts_phrase(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+fn fts_query(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .windows(3)
+        .map(|w| {
+            let gram: String = w.iter().collect();
+            format!("\"{}\"", gram.replace('"', "\"\""))
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn text(v: impl Into<String>) -> SqlValue {
@@ -203,6 +211,7 @@ fn int(v: i64) -> SqlValue {
 struct Plan {
     columns: String,
     from_where: String,
+    order_col: &'static str,
     select_args: Vec<SqlValue>,
     where_args: Vec<SqlValue>,
 }
@@ -224,6 +233,7 @@ impl Plan {
         Self {
             columns,
             from_where,
+            order_col: "o.id",
             select_args: args.clone(),
             where_args: args,
         }
@@ -298,9 +308,9 @@ fn build_predicate(f: &Filter, pid: Option<i64>, fts: bool) -> Result<(String, V
         Op::Contains => {
             if f.fold && fts && folded.chars().count() >= 3 {
                 (
-                    "EXISTS (SELECT 1 FROM fts WHERE fts.object_id = o.id AND fts.path_id = ? AND fts MATCH ?)"
+                    "EXISTS (SELECT 1 FROM fts JOIN props p ON p.object_id = fts.object_id AND p.path_id = fts.path_id WHERE fts.object_id = o.id AND fts.path_id = ? AND fts MATCH ? AND instr(p.norm, ?) > 0)"
                         .to_string(),
-                    vec![int(pid), text(fts_phrase(&folded))],
+                    vec![int(pid), text(fts_query(&folded)), text(folded)],
                 )
             } else {
                 (
@@ -348,17 +358,23 @@ fn fast_plan(f: &Filter, pid: Option<i64>, fts: bool) -> Result<Option<Plan>> {
     let folded = fold(&raw_value);
     let plan = match f.op {
         Op::Eq => {
-            let (idx, col, value) = if f.fold {
-                ("idx_props_norm", "p.norm", folded)
-            } else {
-                ("idx_props_lookup", "p.value", raw_value)
-            };
-            Plan::fast(
+            if raw_value.starts_with('{') || raw_value.starts_with('[') {
+                return Ok(None);
+            }
+            let mut predicate = "p.type IN (0,1,2,3) AND p.norm = ?".to_string();
+            let mut args = vec![int(pid), text(folded)];
+            if !f.fold {
+                predicate.push_str(" AND p.value = ?");
+                args.push(text(raw_value));
+            }
+            let mut plan = Plan::fast(
                 format!(
-                    "FROM props p INDEXED BY {idx} JOIN objects o ON o.id = p.object_id WHERE p.path_id = ? AND {col} = ?"
+                    "FROM props p INDEXED BY idx_props_search JOIN objects o ON o.id = p.object_id WHERE p.path_id = ? AND {predicate}"
                 ),
-                vec![int(pid), text(value)],
-            )
+                args,
+            );
+            plan.order_col = "p.object_id";
+            plan
         }
         Op::Prefix => {
             let (col, value) = if f.fold {
@@ -411,9 +427,9 @@ fn fast_plan(f: &Filter, pid: Option<i64>, fts: bool) -> Result<Option<Plan>> {
             vec![int(pid)],
         ),
         Op::Contains if f.fold && fts && folded.chars().count() >= 3 => Plan::fast(
-            "FROM fts JOIN objects o ON o.id = fts.object_id JOIN props p ON p.object_id = o.id AND p.path_id = fts.path_id WHERE fts MATCH ? AND fts.path_id = ? AND p.type = ?"
+            "FROM fts JOIN props p ON p.object_id = fts.object_id AND p.path_id = fts.path_id JOIN objects o ON o.id = fts.object_id WHERE fts MATCH ? AND fts.path_id = ? AND p.type = ? AND instr(p.norm, ?) > 0"
                 .to_string(),
-            vec![text(fts_phrase(&folded)), int(pid), int(T_STRING)],
+            vec![text(fts_query(&folded)), int(pid), int(T_STRING), text(folded)],
         ),
         _ => return Ok(None),
     };
@@ -474,7 +490,8 @@ fn plan(conn: &Connection, q: &SearchQuery) -> Result<Plan> {
     let joiner = if q.any { " OR " } else { " AND " };
     Ok(Plan {
         columns,
-        from_where: format!("FROM objects o WHERE {}", preds.join(joiner)),
+        from_where: format!("FROM objects o WHERE ({})", preds.join(joiner)),
+        order_col: "o.id",
         select_args,
         where_args,
     })
@@ -486,8 +503,8 @@ pub fn search(conn: &Connection, q: &SearchQuery) -> Result<Vec<Hit>> {
     args.push(int(q.after.unwrap_or(-1)));
     args.push(int(q.limit.clamp(1, 10_000) as i64));
     let sql = format!(
-        "SELECT {} {} AND o.id > ? ORDER BY o.id LIMIT ?",
-        plan.columns, plan.from_where
+        "SELECT {} {} AND {} > ? ORDER BY {} LIMIT ?",
+        plan.columns, plan.from_where, plan.order_col, plan.order_col
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(args.iter()), |r| {

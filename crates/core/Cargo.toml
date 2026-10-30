@@ -1,10 +1,27 @@
 [package]
 name = "jxcore"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Escáner JSON por streaming e índice SQLite para ficheros gigantes"
+keywords = ["json", "sqlite", "search", "index", "streaming"]
+categories = ["database", "parsing"]
 
 [dependencies]
-anyhow = "1.0.104"
-memchr = "2.8.3"
-rusqlite = { version = "0.41.1", features = ["bundled"] }
-serde_json = "1.0.154"
+anyhow.workspace = true
+memchr.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

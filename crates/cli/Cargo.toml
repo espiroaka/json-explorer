@@ -1,11 +1,27 @@
 [package]
 name = "jexplorer"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Explora y busca ficheros JSON gigantes sin cargarlos en memoria"
+keywords = ["json", "cli", "search", "sqlite"]
+categories = ["command-line-utilities"]
 
 [dependencies]
-anyhow = "1.0.104"
-clap = { version = "4.6.7", features = ["derive"] }
-jxcore = { version = "0.1.0", path = "../core" }
-rusqlite = "0.41.1"
-rustyline = "19.0.0"
+anyhow.workspace = true
+clap.workspace = true
+jxcore = { version = "0.2.0", path = "../core" }
+rusqlite.workspace = true
+rustyline.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

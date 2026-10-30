@@ -36,7 +36,13 @@ impl Window {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
-        Ok(Self { file, buf: vec![0; CHUNK], base: 0, len: 0, size })
+        Ok(Self {
+            file,
+            buf: vec![0; CHUNK],
+            base: 0,
+            len: 0,
+            size,
+        })
     }
 
     pub fn size(&self) -> u64 {
@@ -156,7 +162,9 @@ impl Window {
                 loop {
                     match self.byte_at(pos)? {
                         None => return Ok(pos),
-                        Some(b) if b == b',' || b == b'}' || b == b']' || b.is_ascii_whitespace() => {
+                        Some(b)
+                            if b == b',' || b == b'}' || b == b']' || b.is_ascii_whitespace() =>
+                        {
                             return Ok(pos);
                         }
                         Some(_) => pos += 1,
@@ -192,7 +200,12 @@ impl RootScanner {
             }
             next += 1;
         }
-        Ok(Self { win, next, done: false, last_end: resume_at })
+        Ok(Self {
+            win,
+            next,
+            done: false,
+            last_end: resume_at,
+        })
     }
 
     pub fn next_into(&mut self, key: &mut String) -> io::Result<Option<Span>> {
@@ -231,7 +244,10 @@ impl RootScanner {
         let vend = self.win.scan_value_end(pos)?;
         self.last_end = vend;
         self.next = vend;
-        Ok(Some(Span { start: pos, len: vend - pos }))
+        Ok(Some(Span {
+            start: pos,
+            len: vend - pos,
+        }))
     }
 
     pub fn position(&self) -> u64 {
@@ -243,11 +259,18 @@ impl RootScanner {
     }
 
     fn decode_key(&mut self, start: u64, end: u64, out: &mut String) -> io::Result<()> {
-        let raw = match self.win.slice_opt(Span { start, len: end - start })? {
+        let raw = match self.win.slice_opt(Span {
+            start,
+            len: end - start,
+        })? {
             Some(r) => r,
             None => return Ok(()),
         };
-        let inner = if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { &[][..] };
+        let inner = if raw.len() >= 2 {
+            &raw[1..raw.len() - 1]
+        } else {
+            &[][..]
+        };
         if inner.contains(&b'\\') {
             match serde_json::from_slice::<String>(raw) {
                 Ok(s) => out.push_str(&s),
@@ -365,7 +388,12 @@ pub fn object_members(data: &[u8], out: &mut Vec<MemberIdx>) -> anyhow::Result<(
         i = skip_ws_mem(data, i + 1);
         let val_start = i;
         let val_end = scan_value_mem(data, i)?;
-        out.push(MemberIdx { key_start, key_end, val_start, val_end });
+        out.push(MemberIdx {
+            key_start,
+            key_end,
+            val_start,
+            val_end,
+        });
         i = val_end;
     }
 }
@@ -390,18 +418,24 @@ mod tests {
     #[test]
     fn parsea_anidados_y_escapes() {
         let got = members_of(r#"{"a":"x}y","b":{"c":[1,{"d":"]"}]},"e":12}"#);
-        assert_eq!(got, vec![
-            ("a".into(), r#""x}y""#.into()),
-            ("b".into(), r#"{"c":[1,{"d":"]"}]}"#.into()),
-            ("e".into(), "12".into()),
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                ("a".into(), r#""x}y""#.into()),
+                ("b".into(), r#"{"c":[1,{"d":"]"}]}"#.into()),
+                ("e".into(), "12".into()),
+            ]
+        );
     }
 
     #[test]
     fn tolera_espacios_y_vacios() {
         assert!(members_of("{}").is_empty());
         let got = members_of(" {\n \"a\" : null ,\n \"b\" : true } ");
-        assert_eq!(got, vec![("a".into(), "null".into()), ("b".into(), "true".into())]);
+        assert_eq!(
+            got,
+            vec![("a".into(), "null".into()), ("b".into(), "true".into())]
+        );
     }
 
     #[test]

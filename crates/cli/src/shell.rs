@@ -2,11 +2,11 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Result};
-use jxcore::{Hit, Op, SearchQuery};
+use anyhow::{Result, anyhow, bail};
+use jxcore::{Filter, Hit, Op, SearchQuery};
 use rusqlite::Connection;
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 use crate::{bytes, fmt, trim};
 
@@ -23,13 +23,15 @@ struct Session {
     db: PathBuf,
     props: Vec<String>,
     hits: Vec<Hit>,
-    last: Option<(String, Op, String)>,
+    last: Option<(Vec<Filter>, bool)>,
 }
 
 pub fn run(db: &Path) -> Result<()> {
     let (conn, freshness) = jxcore::open_checked(db)?;
     if freshness != jxcore::Freshness::Ok {
-        eprintln!("aviso: la fecha de modificación del JSON no coincide con la del índice; el contenido sigue intacto.");
+        eprintln!(
+            "aviso: la fecha de modificación del JSON no coincide con la del índice; el contenido sigue intacto."
+        );
     }
     let info = jxcore::stats(&conn)?;
     let props: Vec<&str> = info.paths.iter().map(|(p, _)| p.as_str()).collect();
@@ -39,7 +41,11 @@ pub fn run(db: &Path) -> Result<()> {
         "       {} objetos · índice {} · propiedades: {}",
         fmt(info.objects),
         bytes(std::fs::metadata(db).map(|m| m.len()).unwrap_or(0)),
-        if props.is_empty() { "ninguna".into() } else { props.join(", ") }
+        if props.is_empty() {
+            "ninguna".into()
+        } else {
+            props.join(", ")
+        }
     );
     println!("       Escribe una consulta como `nombre = Antonio`, o `ayuda`. `q` para salir.\n");
 
@@ -128,6 +134,8 @@ impl Session {
             "r" | "raw" | "crudo" => self.view(parse_pos(rest)?, true)?,
             "e" | "export" | "exportar" => self.export(rest)?,
             "g" | "get" | "id" => self.by_id(parse_id(rest)?)?,
+            "k" | "key" | "clave" => self.by_key(rest)?,
+            "top" | "agrupar" | "groupby" | "grupos" => self.top(rest)?,
             "stats" => self.stats()?,
             "props" => self.props()?,
             "s" | "search" | "buscar" => self.query(rest)?,
@@ -140,64 +148,80 @@ impl Session {
         let Some((path, rest)) = split_first(rest) else {
             bail!("uso: <propiedad> <operador> <valor>, por ejemplo `nombre = Antonio`");
         };
-        let Some((op, value)) = split_first(rest) else {
-            bail!("falta el operador: usa =, ~ (contiene) o ^ (empieza por)");
+        let Some((op_str, value)) = split_first(rest) else {
+            bail!("falta el operador: usa =, !=, ~, ~i, ^, >, >=, <, <=, ?, !?, null o ~r");
         };
+        let (op, fold) = parse_op_fold(op_str)?;
         let value = value.trim();
-        if value.is_empty() {
-            bail!("falta el valor a buscar");
-        }
-        self.run_page(path.to_string(), parse_op(op)?, value.to_string(), None, true)
+        let value = if op.needs_value() {
+            if value.is_empty() {
+                bail!("falta el valor a buscar");
+            }
+            Some(value.to_string())
+        } else {
+            None
+        };
+        self.run_page(vec![Filter::new(path, op, value, fold)], false, None, true)
     }
 
     fn run_page(
         &mut self,
-        path: String,
-        op: Op,
-        value: String,
+        filters: Vec<Filter>,
+        any: bool,
         after: Option<i64>,
         fresh: bool,
     ) -> Result<()> {
-        if !self.props.iter().any(|p| p == &path) {
-            let lista = if self.props.is_empty() {
-                "el índice no tiene ninguna propiedad".to_string()
-            } else {
-                format!("disponibles: {}", self.props.join(", "))
-            };
-            bail!("la propiedad `{path}` no está indexada; {lista}");
+        for f in &filters {
+            if !self.props.iter().any(|p| p == &f.path) {
+                let lista = if self.props.is_empty() {
+                    "el índice no tiene ninguna propiedad".to_string()
+                } else {
+                    format!("disponibles: {}", self.props.join(", "))
+                };
+                bail!("la propiedad `{}` no está indexada; {lista}", f.path);
+            }
         }
-        let q = SearchQuery {
-            path: path.clone(),
-            op,
-            value: value.clone(),
+        let query = SearchQuery {
+            filters: filters.clone(),
+            any,
             limit: PAGE,
             after,
         };
         let t = Instant::now();
-        let hits = jxcore::search(&self.conn, &q)?;
+        let hits = jxcore::search(&self.conn, &query)?;
         let ms = t.elapsed().as_secs_f64() * 1000.0;
 
         if hits.is_empty() {
             self.hits.clear();
             if fresh {
-                self.last = Some((path, op, value));
+                self.last = Some((filters, any));
             }
             println!("sin resultados ({ms:.0} ms)");
             return Ok(());
         }
 
         if fresh {
-            self.last = Some((path, op, value));
+            self.last = Some((filters.clone(), any));
         }
+        let label = filters
+            .iter()
+            .find(|f| !matches!(f.op, Op::Exists | Op::Missing))
+            .map(|f| f.path.as_str())
+            .unwrap_or("");
         let shown = hits.len();
         self.hits = hits;
         for (i, h) in self.hits.iter().enumerate() {
+            let value = if h.value.is_empty() {
+                "—".to_string()
+            } else {
+                trim(&h.value, 44)
+            };
             println!(
                 "{:>3}  {:>9}  {:<26} {:<44} [{offset} · {len} B]",
                 i + 1,
                 h.id,
                 trim(&h.root_key, 26),
-                trim(&h.value, 44),
+                format!("{label} = {value}"),
                 offset = h.offset,
                 len = h.length
             );
@@ -212,7 +236,7 @@ impl Session {
     }
 
     fn next_page(&mut self) -> Result<()> {
-        let Some((path, op, value)) = self.last.clone() else {
+        let Some((filters, any)) = self.last.clone() else {
             println!("no hay ninguna búsqueda activa");
             return Ok(());
         };
@@ -221,7 +245,7 @@ impl Session {
             return Ok(());
         }
         let after = self.hits.last().map(|h| h.id);
-        self.run_page(path, op, value, after, false)
+        self.run_page(filters, any, after, false)
     }
 
     fn view(&mut self, pos: usize, raw: bool) -> Result<()> {
@@ -249,6 +273,18 @@ impl Session {
         Ok(())
     }
 
+    fn by_key(&mut self, rest: &str) -> Result<()> {
+        let key = unquote(rest.trim());
+        if key.is_empty() {
+            bail!("uso: key <clave-raíz>");
+        }
+        let json = jxcore::index_json_path(&self.conn)?;
+        let (offset, length) = jxcore::object_span_by_key(&self.conn, &key)?;
+        let data = jxcore::read_object(&json, offset, length)?;
+        print_capped(&jxcore::pretty(&data)?);
+        Ok(())
+    }
+
     fn export(&mut self, rest: &str) -> Result<()> {
         let Some((pos, file)) = split_first(rest) else {
             bail!("uso: e <n> <fichero>");
@@ -271,6 +307,47 @@ impl Session {
         Ok(())
     }
 
+    fn top(&mut self, rest: &str) -> Result<()> {
+        let Some((path, rest)) = split_first(rest) else {
+            bail!("uso: top <propiedad> [n]");
+        };
+        let limit = if rest.trim().is_empty() {
+            10
+        } else {
+            rest.trim()
+                .parse::<usize>()
+                .map_err(|_| anyhow!("`{rest}` no es un número"))?
+        };
+        let groups = jxcore::group_by(&self.conn, path, limit)?;
+        if groups.is_empty() {
+            println!("sin valores para `{path}`");
+            return Ok(());
+        }
+        let w = groups
+            .iter()
+            .map(|g| g.value.chars().count())
+            .max()
+            .unwrap_or(12)
+            .clamp(12, 60);
+        println!(
+            "{:<w$}  {:<10}  {:>12}",
+            "valor",
+            "tipo",
+            "apariciones",
+            w = w
+        );
+        for g in &groups {
+            println!(
+                "{:<w$}  {:<10}  {:>12}",
+                trim(&g.value, w),
+                jxcore::type_name(g.kind),
+                fmt(g.count),
+                w = w
+            );
+        }
+        Ok(())
+    }
+
     fn props(&self) -> Result<()> {
         let info = jxcore::stats(&self.conn)?;
         if info.paths.is_empty() {
@@ -287,8 +364,24 @@ impl Session {
         let info = jxcore::stats(&self.conn)?;
         println!("JSON:    {}", info.json_path.display());
         println!("Estado:  {}", info.status);
-        println!("Tamaño:  {} · {} objetos", bytes(info.size), fmt(info.objects));
-        println!("Índice:  {}", bytes(std::fs::metadata(&self.db).map(|m| m.len()).unwrap_or(0)));
+        println!(
+            "Modo:    {}",
+            if info.all {
+                "todas las propiedades"
+            } else {
+                "seleccionadas"
+            }
+        );
+        println!("FTS:     {}", if info.fts { "sí" } else { "no" });
+        println!(
+            "Tamaño:  {} · {} objetos",
+            bytes(info.size),
+            fmt(info.objects)
+        );
+        println!(
+            "Índice:  {}",
+            bytes(std::fs::metadata(&self.db).map(|m| m.len()).unwrap_or(0))
+        );
         Ok(())
     }
 }
@@ -297,12 +390,22 @@ fn print_help() {
     println!(
         "\
 consulta        nombre = Antonio        valor exacto
+                nombre =i antonio       sin mayúsculas ni acentos
+                nombre != Antonio       distinto
                 nombre ~ Ant            contiene
-                nombre ^ Ant            empieza por
+                nombre ~i ant           contiene sin mayúsculas ni acentos
+                nombre ^ Ant            empieza por   (^i sin acentos)
+                edad > 40               también >=, < y <=
+                email ?                 existe
+                email !?                no existe
+                email null              es nulo
+                nombre ~r ^Ant          expresión regular
 n               siguiente página
 ver <n>         abrir el resultado n formateado   (v)
 raw <n>         abrir el resultado n tal cual está en el fichero   (r)
 id <id>         abrir un objeto por su id interno
+key <clave>     abrir un objeto por su clave raíz   (k)
+top <prop> [n]  valores más frecuentes de una propiedad
 e <n> <fichero> exportar el resultado n a un fichero
 props           propiedades indexadas
 stats           datos del índice
@@ -313,7 +416,9 @@ q               salir"
 fn print_capped(text: &str) {
     for (i, line) in text.lines().enumerate() {
         if i == MAX_VIEW_LINES {
-            println!("… vista truncada a {MAX_VIEW_LINES} líneas; usa `e <n> fichero.json` para volcarlo entero");
+            println!(
+                "… vista truncada a {MAX_VIEW_LINES} líneas; usa `e <n> fichero.json` para volcarlo entero"
+            );
             return;
         }
         println!("{line}");
@@ -324,10 +429,10 @@ fn looks_like_query(line: &str) -> bool {
     let Some((_, rest)) = split_first(line) else {
         return false;
     };
-    let Some((op, value)) = split_first(rest) else {
+    let Some((op, _)) = split_first(rest) else {
         return false;
     };
-    !value.is_empty() && parse_op(op).is_ok()
+    parse_op_fold(op).is_ok()
 }
 
 fn split_first(s: &str) -> Option<(&str, &str)> {
@@ -341,24 +446,39 @@ fn split_first(s: &str) -> Option<(&str, &str)> {
     })
 }
 
-fn parse_op(s: &str) -> Result<Op> {
-    let op = match s.to_ascii_lowercase().as_str() {
-        "=" | "==" | "eq" | "igual" => Op::Eq,
-        "~" | "contains" | "contiene" => Op::Contains,
-        "^" | "prefix" | "empieza" | "starts_with" => Op::Prefix,
-        other => bail!("operador desconocido `{other}`: usa =, ~ (contiene) o ^ (empieza por)"),
-    };
-    Ok(op)
+fn parse_op_fold(s: &str) -> Result<(Op, bool)> {
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "=" | "==" | "eq" | "igual" => (Op::Eq, false),
+        "=i" | "eqi" => (Op::Eq, true),
+        "!=" | "<>" | "ne" | "distinto" => (Op::Ne, false),
+        "~" | "contains" | "contiene" => (Op::Contains, false),
+        "~i" | "contains_i" => (Op::Contains, true),
+        "^" | "prefix" | "empieza" | "starts_with" => (Op::Prefix, false),
+        "^i" | "prefix_i" => (Op::Prefix, true),
+        ">" | "gt" | "mayor" => (Op::Gt, false),
+        ">=" | "gte" | "mayor_igual" => (Op::Gte, false),
+        "<" | "lt" | "menor" => (Op::Lt, false),
+        "<=" | "lte" | "menor_igual" => (Op::Lte, false),
+        "?" | "exists" | "existe" => (Op::Exists, false),
+        "!?" | "missing" | "falta" => (Op::Missing, false),
+        "null" | "nulo" => (Op::Null, false),
+        "~r" | "regex" => (Op::Regex, false),
+        other => bail!(
+            "operador desconocido `{other}`: usa =, !=, ~, ~i, ^, >, >=, <, <=, ?, !?, null o ~r"
+        ),
+    })
 }
 
 fn parse_pos(s: &str) -> Result<usize> {
     let s = s.trim();
-    s.parse().map_err(|_| anyhow!("uso: ver <n>, donde n es el número de resultado"))
+    s.parse()
+        .map_err(|_| anyhow!("uso: ver <n>, donde n es el número de resultado"))
 }
 
 fn parse_id(s: &str) -> Result<i64> {
     let s = s.trim();
-    s.parse().map_err(|_| anyhow!("uso: id <id>, donde id es el identificador interno del objeto"))
+    s.parse()
+        .map_err(|_| anyhow!("uso: id <id>, donde id es el identificador interno del objeto"))
 }
 
 fn unquote(s: &str) -> String {

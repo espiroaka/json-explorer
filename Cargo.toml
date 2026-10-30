@@ -3,9 +3,32 @@ members = ["crates/core", "crates/cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.87"
 license = "MIT"
+authors = ["The json-explorer authors"]
+repository = "https://github.com/espiroaka/json-explorer"
+readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+memchr = "2.8.3"
+regex = "1.11"
+rusqlite = { version = "0.41.1", features = ["bundled", "functions"] }
+rustyline = "19.0.0"
+serde_json = "1.0.154"
+tempfile = "3.23"
+unicode-normalization = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+uninlined_format_args = "warn"
+redundant_clone = "warn"
 
 [profile.release]
 opt-level = 3

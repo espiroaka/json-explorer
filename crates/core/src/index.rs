@@ -633,7 +633,7 @@ fn run_worker(args: WorkerArgs) -> Result<ShardDone> {
         .iter()
         .sum();
 
-    if fts {
+    let run_fts = |conn: &mut Connection| -> Result<()> {
         let _ = progress.send(Progress {
             phase: Phase::Fts,
             objects: fts_objects.load(Ordering::Relaxed),
@@ -643,37 +643,47 @@ fn run_worker(args: WorkerArgs) -> Result<ShardDone> {
             step: 0,
             steps: 0,
         });
-        build_fts(
-            &mut conn,
-            &progress,
-            &fts_objects,
-            total_objects,
-            objects,
-            t0,
-        )?;
-    }
+        build_fts(conn, &progress, &fts_objects, total_objects, objects, t0)
+    };
+    let run_indexes = |conn: &mut Connection| -> Result<()> {
+        // Bulk sorting must be able to spill to disk for large indexes.
+        conn.execute_batch("PRAGMA temp_store=FILE;")?;
+        conn.pragma_update(None, "threads", index_threads)?;
+        let indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_props_search ON props(path_id, norm, object_id) WHERE type IN (0,1,2,3)",
+            "CREATE INDEX IF NOT EXISTS idx_objects_key ON objects(root_key)",
+        ];
+        for sql in indexes {
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql)?;
+            tx.commit()?;
+            let step = index_steps.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = progress.send(Progress {
+                phase: Phase::Indexes,
+                objects: total_objects,
+                bytes: 0,
+                total_bytes: total_objects,
+                elapsed: t0.elapsed().as_secs_f64(),
+                step: step as u32,
+                steps: total_index_steps,
+            });
+        }
+        Ok(())
+    };
 
-    // Bulk sorting must be able to spill to disk for large indexes.
-    conn.execute_batch("PRAGMA temp_store=FILE;")?;
-    conn.pragma_update(None, "threads", index_threads)?;
-    let indexes = [
-        "CREATE INDEX IF NOT EXISTS idx_props_search ON props(path_id, norm, object_id) WHERE type IN (0,1,2,3)",
-        "CREATE INDEX IF NOT EXISTS idx_objects_key ON objects(root_key)",
-    ];
-    for sql in indexes {
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)?;
-        tx.commit()?;
-        let step = index_steps.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = progress.send(Progress {
-            phase: Phase::Indexes,
-            objects: total_objects,
-            bytes: 0,
-            total_bytes: total_objects,
-            elapsed: t0.elapsed().as_secs_f64(),
-            step: step as u32,
-            steps: total_index_steps,
-        });
+    // Los fragmentos impares invierten el orden para que la FTS de unos se
+    // solape con la creación de índices de los otros; hacerlas siempre en serie
+    // deja sin trabajo a media máquina durante la fase más larga.
+    if index % 2 == 1 {
+        run_indexes(&mut conn)?;
+        if fts {
+            run_fts(&mut conn)?;
+        }
+    } else {
+        if fts {
+            run_fts(&mut conn)?;
+        }
+        run_indexes(&mut conn)?;
     }
 
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;

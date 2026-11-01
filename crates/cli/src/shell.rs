@@ -379,6 +379,8 @@ impl Shell {
         );
         let mut last = Instant::now();
         let mut last_phase: Option<Phase> = None;
+        let mut announced_fts = false;
+        let mut announced_indexes = false;
         let result = jxcore::build_index(source, dir, &opts, move |p| {
             let changed = last_phase != Some(p.phase);
             if changed {
@@ -386,8 +388,18 @@ impl Shell {
                 last = Instant::now();
                 match p.phase {
                     Phase::Ingest => {}
-                    Phase::Fts => eprintln!("\n  Creando índice de texto completo (FTS)…"),
-                    Phase::Indexes => eprintln!("\n  Creando índices de búsqueda…"),
+                    Phase::Fts => {
+                        if !announced_fts {
+                            announced_fts = true;
+                            eprintln!("\n  Creando índice de texto completo (FTS)…");
+                        }
+                    }
+                    Phase::Indexes => {
+                        if !announced_indexes {
+                            announced_indexes = true;
+                            eprintln!("\n  Creando índices de búsqueda…");
+                        }
+                    }
                 }
             } else if last.elapsed() < Duration::from_millis(200) {
                 return;

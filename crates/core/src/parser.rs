@@ -139,40 +139,70 @@ impl Window {
                 let mut depth = 0i64;
                 let mut pos = start;
                 loop {
-                    match self.byte_at(pos)? {
-                        None => return Err(eof_err()),
-                        Some(b'"') => {
-                            pos = self.skip_string(pos)?;
-                            continue;
+                    self.ensure(pos)?;
+                    let end = self.base + self.len as u64;
+                    if pos >= end {
+                        return Err(eof_err());
+                    }
+                    let s = (pos - self.base) as usize;
+                    let hay = &self.buf[s..self.len];
+                    let Some(off) = next_structural(hay) else {
+                        if end >= self.size {
+                            return Err(eof_err());
                         }
-                        Some(b'{') | Some(b'[') => depth += 1,
-                        Some(b'}') | Some(b']') => {
+                        pos = end;
+                        continue;
+                    };
+                    let at = pos + off as u64;
+                    match hay[off] {
+                        b'"' => pos = self.skip_string(at)?,
+                        b'{' | b'[' => {
+                            depth += 1;
+                            pos = at + 1;
+                        }
+                        _ => {
                             depth -= 1;
                             if depth == 0 {
-                                return Ok(pos + 1);
+                                return Ok(at + 1);
                             }
+                            pos = at + 1;
                         }
-                        Some(_) => {}
                     }
-                    pos += 1;
                 }
             }
             Some(_) => {
                 let mut pos = start;
                 loop {
-                    match self.byte_at(pos)? {
-                        None => return Ok(pos),
-                        Some(b)
-                            if b == b',' || b == b'}' || b == b']' || b.is_ascii_whitespace() =>
-                        {
-                            return Ok(pos);
-                        }
-                        Some(_) => pos += 1,
+                    self.ensure(pos)?;
+                    let end = self.base + self.len as u64;
+                    if pos >= end {
+                        return Ok(pos);
+                    }
+                    let s = (pos - self.base) as usize;
+                    let hay = &self.buf[s..self.len];
+                    match hay.iter().position(|b| is_value_delimiter(*b)) {
+                        Some(off) => return Ok(pos + off as u64),
+                        None => pos = end,
                     }
                 }
             }
         }
     }
+}
+
+fn next_structural(hay: &[u8]) -> Option<usize> {
+    let first = memchr::memchr3(b'"', b'{', b'[', hay);
+    let second = memchr::memchr3(b'"', b'}', b']', hay);
+    match (first, second) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn is_value_delimiter(b: u8) -> bool {
+    b == b',' || b == b'}' || b == b']' || b.is_ascii_whitespace()
 }
 
 pub struct RootScanner {

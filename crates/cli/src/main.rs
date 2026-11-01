@@ -17,6 +17,7 @@ struct Cli {
 }
 
 fn main() {
+    jxcore::init_sqlite();
     let cli = Cli::parse();
     if let Err(e) = shell::run(cli.file.as_deref()) {
         eprintln!("error: {e:#}");

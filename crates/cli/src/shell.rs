@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use jxcore::{Filter, Hit, IndexOptions, Op, Phase, SearchQuery};
+use jxcore::{Filter, Hit, Index, IndexOptions, Op, Phase, SearchQuery};
 use rusqlite::Connection;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -113,6 +113,10 @@ struct IndexArgs {
     fts: bool,
     #[arg(long, default_value_t = 20000)]
     batch: usize,
+    /// Número de fragmentos y de hilos de indexación (0 = automático)
+    #[arg(long, default_value_t = 0)]
+    jobs: usize,
+    /// Carpeta del índice (por defecto, el almacén de la aplicación)
     #[arg(long)]
     db: Option<PathBuf>,
     #[arg(long)]
@@ -137,11 +141,17 @@ struct Shell {
 }
 
 struct Session {
-    conn: Connection,
-    db: PathBuf,
+    index: Index,
+    dir: PathBuf,
     props: Vec<String>,
     hits: Vec<Hit>,
     last: Option<(Vec<Filter>, bool)>,
+}
+
+fn local_index_dir(json: &Path) -> PathBuf {
+    let mut text = json.as_os_str().to_os_string();
+    text.push(".jindex");
+    PathBuf::from(text)
 }
 
 pub fn run(file: Option<&Path>) -> Result<()> {
@@ -152,7 +162,7 @@ pub fn run(file: Option<&Path>) -> Result<()> {
         "jexplorer {} · shell interactivo",
         env!("CARGO_PKG_VERSION")
     );
-    println!("Escribe `abrir <fichero.json o .jindex>`, `ayuda` o `q` para salir.\n");
+    println!("Escribe `abrir <fichero.json o carpeta de índice>`, `ayuda` o `q` para salir.\n");
     let mut shell = Shell {
         json: None,
         session: None,
@@ -238,45 +248,58 @@ impl Shell {
     }
 
     fn open_file(&mut self, file: &Path) -> Result<()> {
+        if file.is_dir() {
+            if !jxcore::is_index_dir(file) {
+                bail!("la carpeta {} no contiene un índice", file.display());
+            }
+            let session = Session::open(file)?;
+            self.json = Some(session.index.json_path());
+            self.session = Some(session);
+            return Ok(());
+        }
         if !file.is_file() {
             bail!("no existe el fichero {}", file.display());
         }
         let mut header = [0u8; 16];
         let read = File::open(file)?.read(&mut header)?;
-        let is_index = file
+        let old_index = file
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("jindex"))
             || (read == header.len() && &header == b"SQLite format 3\0");
-        if is_index {
-            let session = Session::open(file)?;
-            let source = jxcore::index_json_path(&session.conn)?;
-            self.json = Some(source);
-            self.session = Some(session);
-        } else {
-            let db = jxcore::db_path_for(file);
-            if db.is_file() {
-                match Session::open(&db) {
-                    Ok(session) => {
-                        self.json = Some(jxcore::index_json_path(&session.conn)?);
-                        self.session = Some(session);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        eprintln!("aviso: {}", terminal_text(format!("{e:#}")));
-                        println!(
-                            "Usa `index` para reanudar o `index --force` para rehacer el índice."
-                        );
-                    }
-                }
-            }
-            discover(file, 1000)?;
-            self.json = Some(file.to_path_buf());
-            self.session = None;
-            println!(
-                "JSON: {}\nUsa `index` para indexar todas las propiedades, o `index --fts` para añadir FTS.",
-                terminal_text(file.display().to_string())
+        if old_index {
+            bail!(
+                "`{}` es un índice del formato antiguo de un solo fichero y ya no se puede abrir.\nAbre el JSON original y ejecuta `index --force` para crear el índice nuevo.",
+                file.display()
             );
         }
+
+        let mut candidates = Vec::new();
+        match jxcore::find_for_json(file) {
+            Ok(Some(stored)) => candidates.push(stored.dir),
+            Ok(None) => {}
+            Err(error) => eprintln!("aviso: {}", terminal_text(format!("{error:#}"))),
+        }
+        let local = local_index_dir(file);
+        if jxcore::is_index_dir(&local) {
+            candidates.push(local);
+        }
+        for dir in candidates {
+            match Session::open(&dir) {
+                Ok(session) => {
+                    self.json = Some(session.index.json_path());
+                    self.session = Some(session);
+                    return Ok(());
+                }
+                Err(error) => eprintln!("aviso: {}", terminal_text(format!("{error:#}"))),
+            }
+        }
+        discover(file, 1000)?;
+        self.json = Some(file.to_path_buf());
+        self.session = None;
+        println!(
+            "JSON: {}\nUsa `index` para indexar todas las propiedades, o `index --fts` para añadir FTS.",
+            terminal_text(file.display().to_string())
+        );
         Ok(())
     }
 
@@ -297,40 +320,82 @@ impl Shell {
         }
         let source = self
             .json
-            .as_ref()
+            .clone()
             .context("abre un JSON primero con `abrir <fichero>`")?;
-        let db = args.db.unwrap_or_else(|| {
-            self.session
-                .as_ref()
-                .map(|s| s.db.clone())
-                .unwrap_or_else(|| jxcore::db_path_for(source))
-        });
+        let dir = match args.db {
+            Some(dir) => dir,
+            None => match &self.session {
+                Some(session) if session.index.json_path() == source => session.dir.clone(),
+                _ => jxcore::dir_for_json(&source)?,
+            },
+        };
         let opts = IndexOptions {
             all: args.all || args.select.is_empty(),
             select: args.select,
             fts: args.fts,
             batch: args.batch,
+            jobs: args.jobs,
             force: args.force,
         };
-        if db == *source || (db.exists() && same_file::is_same_file(&db, source)?) {
+        self.build(&source, &dir, opts)
+    }
+
+    fn reindex(&mut self, dir: &Path) -> Result<()> {
+        let manifest = jxcore::read_manifest(dir)?;
+        let source = PathBuf::from(&manifest.source);
+        if !source.is_file() {
+            bail!(
+                "no encuentro el JSON original en {}; devuélvelo a su sitio o reindexa desde el JSON",
+                manifest.source
+            );
+        }
+        let opts = IndexOptions {
+            all: manifest.all,
+            select: if manifest.all {
+                Vec::new()
+            } else {
+                manifest.props.clone()
+            },
+            fts: manifest.fts,
+            batch: 20_000,
+            jobs: 0,
+            force: true,
+        };
+        self.json = Some(source.clone());
+        self.build(&source, dir, opts)
+    }
+
+    fn build(&mut self, source: &Path, dir: &Path, opts: IndexOptions) -> Result<()> {
+        if dir == source || (dir.is_file() && same_file::is_same_file(dir, source)?) {
             bail!("el índice no puede sobrescribir el JSON original");
         }
         let previous = self.session.take();
-        let previous_db = previous.as_ref().map(|s| s.db.clone());
+        let previous_dir = previous.as_ref().map(|s| s.dir.clone());
         drop(previous);
         eprintln!(
             "Indexando {}\n      → {}",
             terminal_text(source.display().to_string()),
-            terminal_text(db.display().to_string())
+            terminal_text(dir.display().to_string())
         );
         let mut last = Instant::now();
-        let result = jxcore::build_index(source, &db, &opts, |p| {
+        let mut last_phase: Option<Phase> = None;
+        let result = jxcore::build_index(source, dir, &opts, move |p| {
+            let changed = last_phase != Some(p.phase);
+            if changed {
+                last_phase = Some(p.phase);
+                last = Instant::now();
+                match p.phase {
+                    Phase::Ingest => {}
+                    Phase::Fts => eprintln!("\n  Creando índice de texto completo (FTS)…"),
+                    Phase::Indexes => eprintln!("\n  Creando índices de búsqueda…"),
+                }
+            } else if last.elapsed() < Duration::from_millis(200) {
+                return;
+            } else {
+                last = Instant::now();
+            }
             match p.phase {
                 Phase::Ingest => {
-                    if last.elapsed() < Duration::from_millis(200) {
-                        return;
-                    }
-                    last = Instant::now();
                     let mb = p.bytes as f64 / (1024.0 * 1024.0);
                     let rate = if p.elapsed > 0.0 { mb / p.elapsed } else { 0.0 };
                     let pct = if p.total_bytes > 0 {
@@ -345,18 +410,20 @@ impl Shell {
                     );
                 }
                 Phase::Fts => {
-                    if p.step == 0 {
-                        eprintln!("\n  Creando índice de texto completo (FTS)…");
+                    let pct = if p.total_bytes > 0 {
+                        p.objects as f64 * 100.0 / p.total_bytes as f64
                     } else {
-                        eprint!("\r  FTS {}/{}  {:.1} s   ", p.step, p.steps, p.elapsed);
-                    }
+                        100.0
+                    };
+                    eprint!(
+                        "\r  FTS {pct:>5.1}%  {} de {} objetos  {:.1} s   ",
+                        fmt(p.objects),
+                        fmt(p.total_bytes),
+                        p.elapsed
+                    );
                 }
                 Phase::Indexes => {
-                    if p.step == 0 {
-                        eprintln!("\n  Creando índices de búsqueda…");
-                    } else {
-                        eprint!("\r  Índices {}/{}  {:.1} s   ", p.step, p.steps, p.elapsed);
-                    }
+                    eprint!("\r  Índices {}/{}  {:.1} s   ", p.step, p.steps, p.elapsed);
                 }
             }
             let _ = io::stderr().flush();
@@ -365,8 +432,8 @@ impl Shell {
         let summary = match result {
             Ok(summary) => summary,
             Err(e) => {
-                if let Some(previous_db) = previous_db {
-                    if let Ok(session) = Session::open(&previous_db) {
+                if let Some(previous_dir) = previous_dir {
+                    if let Ok(session) = Session::open(&previous_dir) {
                         self.session = Some(session);
                     }
                 }
@@ -378,6 +445,7 @@ impl Shell {
             "Propiedades:        {}",
             terminal_text(summary.props.join(", "))
         );
+        println!("Fragmentos:         {}", summary.shards);
         println!("Tiempo:             {:.1} s", summary.elapsed);
         println!("Tamaño del índice:  {}", bytes(summary.db_bytes));
         if summary.skipped > 0 {
@@ -395,7 +463,7 @@ impl Shell {
                 terminal_text(summary.missing.join(", "))
             );
         }
-        self.session = Some(Session::open(&db)?);
+        self.session = Some(Session::open(dir)?);
         Ok(())
     }
 
@@ -421,6 +489,8 @@ impl Shell {
                 self.open(Path::new(&file))?;
             }
             "index" | "indexar" => self.index(rest)?,
+            "indices" | "índices" | "guardados" => self.indices(rest)?,
+            "borrar" | "eliminar" => self.indices(&format!("borrar {rest}"))?,
             "props" => {
                 if rest.is_empty() && self.session.is_some() {
                     self.session()?.props()?;
@@ -463,31 +533,117 @@ impl Shell {
             "no hay un índice abierto; usa `abrir <fichero>` y, si es un JSON sin índice, `index`",
         )
     }
+
+    fn indices(&mut self, rest: &str) -> Result<()> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return self.list_indices();
+        }
+        let (head, arg) = split_first(rest).unwrap_or((rest, ""));
+        match head.to_ascii_lowercase().as_str() {
+            "abrir" | "open" => {
+                let entry = self.stored_index(parse_index_pos(arg)?)?;
+                self.open(&entry.dir)
+            }
+            "borrar" | "eliminar" | "delete" => {
+                let entry = self.stored_index(parse_index_pos(arg)?)?;
+                if self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.dir == entry.dir)
+                {
+                    self.session = None;
+                }
+                jxcore::remove_index(&entry.dir)?;
+                println!(
+                    "borrado el índice de {} ({})",
+                    terminal_text(entry.manifest.source),
+                    entry.dir.display()
+                );
+                Ok(())
+            }
+            "rehacer" | "reindexar" => {
+                let entry = self.stored_index(parse_index_pos(arg)?)?;
+                self.reindex(&entry.dir)
+            }
+            other if other.parse::<usize>().is_ok() => {
+                let entry = self.stored_index(parse_index_pos(rest)?)?;
+                self.open(&entry.dir)
+            }
+            _ => bail!("uso: indices [abrir|borrar|rehacer <n>]"),
+        }
+    }
+
+    fn list_indices(&self) -> Result<()> {
+        let entries = jxcore::list_indices()?;
+        if entries.is_empty() {
+            println!(
+                "no hay índices guardados en {}",
+                terminal_text(jxcore::indexes_root().display().to_string())
+            );
+            return Ok(());
+        }
+        println!(
+            "Índices guardados en {}",
+            terminal_text(jxcore::indexes_root().display().to_string())
+        );
+        for (position, entry) in entries.iter().enumerate() {
+            let manifest = &entry.manifest;
+            let mode = if manifest.all {
+                "todas".to_string()
+            } else {
+                manifest.props.join(", ")
+            };
+            println!(
+                "{:>2}. {} · {} objetos · {}{}",
+                position + 1,
+                fmt(manifest.objects),
+                bytes(entry.bytes),
+                if manifest.fts { " · FTS" } else { "" },
+                if manifest.status == "complete" {
+                    ""
+                } else {
+                    " · incompleto"
+                }
+            );
+            println!(
+                "    {}  [{}]",
+                trim(&terminal_text(&manifest.source), 100),
+                terminal_text(&mode)
+            );
+        }
+        println!("\nUsa `indices abrir <n>`, `indices borrar <n>` o `indices rehacer <n>`.");
+        Ok(())
+    }
+
+    fn stored_index(&self, position: usize) -> Result<jxcore::StoredIndex> {
+        let entries = jxcore::list_indices()?;
+        entries
+            .into_iter()
+            .nth(position.wrapping_sub(1))
+            .with_context(|| format!("no hay un índice guardado con el número {position}"))
+    }
 }
 
 impl Session {
-    fn open(db: &Path) -> Result<Self> {
-        let (conn, freshness) = jxcore::open_checked(db)?;
+    fn open(dir: &Path) -> Result<Self> {
+        let (index, freshness) = Index::open_checked(dir)?;
         if freshness != jxcore::Freshness::Ok {
             eprintln!(
                 "aviso: la fecha de modificación del JSON no coincide con la del índice; el contenido sigue intacto."
             );
         }
-        let info = jxcore::stats(&conn)?;
-        if info.status != "complete" {
-            bail!(
-                "el índice está incompleto; abre el JSON original y ejecuta `index` con las mismas opciones para reanudar"
-            );
-        }
+        let info = index.stats();
         let props: Vec<String> = info.paths.iter().map(|(p, _)| p.clone()).collect();
         println!(
             "JSON:  {}",
             terminal_text(info.json_path.display().to_string())
         );
         println!(
-            "       {} objetos · índice {} · propiedades: {}",
+            "       {} objetos · índice {} · {} fragmentos · propiedades: {}",
             fmt(info.objects),
-            bytes(std::fs::metadata(db)?.len()),
+            bytes(info.index_bytes),
+            info.shards,
             if props.is_empty() {
                 "ninguna".into()
             } else {
@@ -496,8 +652,8 @@ impl Session {
         );
         println!("Escribe una consulta como `nombre = Antonio`, o `ayuda`.\n");
         Ok(Self {
-            conn,
-            db: db.to_path_buf(),
+            index,
+            dir: dir.to_path_buf(),
             props,
             hits: Vec::new(),
             last: None,
@@ -539,7 +695,7 @@ impl Session {
             after,
         };
         let t = Instant::now();
-        let hits = jxcore::search(&self.conn, &query)?;
+        let hits = jxcore::search(&self.index, &query)?;
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         self.print_hits(&hits, &query.filters, ms, output)?;
         if fresh {
@@ -648,7 +804,7 @@ impl Session {
             limit: output.limit,
             after: None,
         };
-        let n = jxcore::count(&self.conn, &q)?;
+        let n = jxcore::count(&self.index, &q)?;
         if output.format == "json" {
             println!("{}", json!({ "count": n }));
         } else {
@@ -675,7 +831,7 @@ impl Session {
             .hits
             .get(pos.wrapping_sub(1))
             .ok_or_else(|| anyhow!("no hay un resultado {pos}; haz una búsqueda primero"))?;
-        let json = jxcore::index_json_path(&self.conn)?;
+        let json = self.index.json_path();
         let data = jxcore::read_object(&json, hit.offset as u64, hit.length as u64)?;
         let text = if raw {
             String::from_utf8_lossy(&data).into_owned()
@@ -687,8 +843,8 @@ impl Session {
     }
 
     fn by_id(&self, id: i64) -> Result<()> {
-        let json = jxcore::index_json_path(&self.conn)?;
-        let (offset, length) = jxcore::object_span(&self.conn, id)?;
+        let json = self.index.json_path();
+        let (offset, length) = self.index.object_span(id)?;
         let data = jxcore::read_object(&json, offset, length)?;
         print_capped(&jxcore::pretty(&data)?);
         Ok(())
@@ -699,8 +855,8 @@ impl Session {
         if key.is_empty() {
             bail!("uso: key <clave-raíz>");
         }
-        let json = jxcore::index_json_path(&self.conn)?;
-        let (offset, length) = jxcore::object_span_by_key(&self.conn, &key)?;
+        let json = self.index.json_path();
+        let (offset, length) = self.index.object_span_by_key(&key)?;
         let data = jxcore::read_object(&json, offset, length)?;
         print_capped(&jxcore::pretty(&data)?);
         Ok(())
@@ -725,12 +881,13 @@ impl Session {
     }
 
     fn export_hit(&self, hit: &Hit, file: &str) -> Result<usize> {
-        let json = jxcore::index_json_path(&self.conn)?;
-        if Path::new(file) == json
-            || Path::new(file) == self.db
-            || (Path::new(file).exists()
-                && (same_file::is_same_file(file, &json)?
-                    || same_file::is_same_file(file, &self.db)?))
+        let json = self.index.json_path();
+        let target = Path::new(file);
+        if target == json
+            || target.starts_with(&self.dir)
+            || (target.exists()
+                && (same_file::is_same_file(target, &json)?
+                    || same_file::is_same_file(target, &self.dir).unwrap_or(false)))
         {
             bail!("no puedes exportar sobre el JSON original o el índice activo");
         }
@@ -751,7 +908,7 @@ impl Session {
             None => 10,
         };
         check_limit(limit)?;
-        let groups = jxcore::group_by(&self.conn, path, limit)?;
+        let groups = jxcore::group_by(&self.index, path, limit)?;
         match output.format {
             "json" => {
                 let rows: Vec<_> = groups.iter().map(|g| json!({ "value": g.value, "type": jxcore::type_name(g.kind), "count": g.count })).collect();
@@ -791,7 +948,7 @@ impl Session {
     }
 
     fn props(&self) -> Result<()> {
-        let info = jxcore::stats(&self.conn)?;
+        let info = self.index.stats();
         if info.paths.is_empty() {
             println!("el índice no tiene propiedades");
         }
@@ -802,7 +959,7 @@ impl Session {
     }
 
     fn stats(&self) -> Result<()> {
-        let info = jxcore::stats(&self.conn)?;
+        let info = self.index.stats();
         println!(
             "JSON:    {}",
             terminal_text(info.json_path.display().to_string())
@@ -822,13 +979,18 @@ impl Session {
             bytes(info.size),
             fmt(info.objects)
         );
-        println!("Índice:  {}", bytes(std::fs::metadata(&self.db)?.len()));
+        println!(
+            "Índice:  {} · {} fragmentos",
+            bytes(info.index_bytes),
+            info.shards
+        );
+        println!("Carpeta: {}", terminal_text(info.dir.display().to_string()));
         Ok(())
     }
 
     fn verify(&self, sample: usize) -> Result<()> {
-        jxcore::check_source(&self.conn)?;
-        let report = jxcore::verify(&self.conn, sample)?;
+        self.index.check_source()?;
+        let report = self.index.verify(sample)?;
         println!("Objetos comprobados:      {}", fmt(report.objects));
         println!("En profundidad:           {}", fmt(report.checked));
         println!("Propiedades comprobadas:  {}", fmt(report.checked_props));
@@ -877,11 +1039,12 @@ fn discover(file: &Path, sample: usize) -> Result<()> {
 fn print_help() {
     println!(
         "\
-abrir <fichero>  abrir JSON o índice .jindex (open)
+abrir <fichero>  abrir JSON o carpeta de índice (open)
 props [n]        propiedades indexadas, o muestra del JSON si aún no hay índice
 index            indexar todas las propiedades del JSON abierto
-                 --select PROP (repetible), --all, --fts, --batch N, --db RUTA
-                 --force para rehacer; `index --help` para ver opciones
+                 --select PROP (repetible), --all, --fts, --batch N, --jobs N
+                 --db CARPETA para elegir dónde guardar; --force para rehacer
+indices          índices guardados; `indices abrir|borrar|rehacer <n>`
 consulta         nombre = Antonio       valor exacto
                  nombre =i antonio      sin mayúsculas ni acentos
                  nombre != Antonio      distinto (!=i con plegado)
@@ -1047,6 +1210,12 @@ fn parse_pos(s: &str) -> Result<usize> {
     s.trim()
         .parse()
         .context("uso: ver <n>, donde n es el número de resultado")
+}
+
+fn parse_index_pos(s: &str) -> Result<usize> {
+    s.trim()
+        .parse()
+        .context("uso: <número de índice>, empezando por 1")
 }
 
 fn parse_id(s: &str) -> Result<i64> {

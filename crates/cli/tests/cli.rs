@@ -31,10 +31,17 @@ fn ctx() -> Ctx {
     ctx_with(DATA)
 }
 
+fn index_here(ctx: &Ctx, extra: &str) -> String {
+    format!("index --db \"{}\" {extra}\n", ctx.db.display())
+}
+
 fn indexed_ctx() -> Ctx {
     let ctx = ctx();
-    clean(&run_file(&ctx.json, "index --fts --batch 2\nq\n"));
-    assert!(ctx.db.is_file());
+    clean(&run_file(
+        &ctx.json,
+        &format!("{}q\n", index_here(&ctx, "--fts --batch 2")),
+    ));
+    assert!(jxcore::is_index_dir(&ctx.db));
     ctx
 }
 
@@ -48,6 +55,7 @@ fn run_raw_with_state(args: &[&str], input: &str, state: &Path) -> Output {
         .args(args)
         .env("APPDATA", state)
         .env("XDG_STATE_HOME", state)
+        .env("JXPLORER_DATA_DIR", state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -80,6 +88,33 @@ fn stored_recent_paths(state: &Path) -> Vec<PathBuf> {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap()
+}
+
+fn stored_index_dirs(state: &Path) -> Vec<PathBuf> {
+    let root = state.join("indexes");
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| jxcore::is_index_dir(path))
+        .collect()
+}
+
+fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read(&path).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 fn success(out: &Output) -> String {
@@ -171,7 +206,9 @@ fn sesion_vacia_banner_ayuda_eof_y_q() {
     assert_eq!(eof.status.code(), Some(0));
 
     let help = clean(&run_raw(&[], "ayuda\nq\n"));
-    for command in ["abrir", "index", "count", "limite", "formato", "verify"] {
+    for command in [
+        "abrir", "index", "count", "limite", "formato", "verify", "indices",
+    ] {
         assert!(help.contains(command), "falta {command}: {help}");
     }
     let quit = clean(&run_raw(&[], "q\nprops\n"));
@@ -229,17 +266,27 @@ fn fichero_inicial_inexistente_o_indice_invalido_sale_con_uno() {
     let ctx = ctx();
     let missing = ctx.dir.path().join("no existe.json");
     let invalid = ctx.dir.path().join("invalido.jindex");
+    let folder = ctx.dir.path().join("carpeta sin indice");
     let malformed = ctx.dir.path().join("JSON roto.json");
     fs::write(&invalid, b"esto no es SQLite").unwrap();
+    fs::create_dir(&folder).unwrap();
     fs::write(&malformed, b"no es JSON").unwrap();
-    for path in [&missing, &invalid, &malformed] {
+    for (path, expected) in [
+        (&missing, "no existe"),
+        (&invalid, "formato antiguo"),
+        (&folder, "no contiene un índice"),
+        (&malformed, "error:"),
+    ] {
         let state = tempfile::tempdir().unwrap();
         let out = run_raw_with_state(&[path.to_str().unwrap()], "", state.path());
-        assert_eq!(out.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("error:"));
-        assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+        assert_eq!(out.status.code(), Some(1), "{}", path.display());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("error:"), "{err}");
+        assert!(err.contains(expected), "{}: {err}", path.display());
+        assert!(!err.contains("panicked"), "{err}");
         assert!(stored_recent_paths(state.path()).is_empty());
         assert!(!state.path().join("jexplorer").exists());
+        assert!(stored_index_dirs(state.path()).is_empty());
     }
 }
 
@@ -298,9 +345,12 @@ fn index_por_defecto_todas_fts_y_reabrir_json_o_indice() {
     let ctx = ctx();
     let text = clean(&run_file(
         &ctx.json,
-        "index --fts --batch 2\nstats\nprops\nformato json\nnombre = Antonio\nq\n",
+        &format!(
+            "{}stats\nprops\nformato json\nnombre = Antonio\nq\n",
+            index_here(&ctx, "--fts --batch 2")
+        ),
     ));
-    assert!(ctx.db.is_file());
+    assert!(jxcore::is_index_dir(&ctx.db));
     assert!(text.contains("FTS:     sí"));
     assert!(text.contains("Modo:    todas las propiedades"));
     assert!(text.contains("ciudad"));
@@ -324,8 +374,9 @@ fn abrir_y_open_rutas_con_espacios_desde_sesion_vacia() {
     let text = clean(&run_raw(
         &[],
         &format!(
-            "abrir \"{}\"\nprops 2\nindex --all\nopen \"{}\"\nformato json\nbuscar nombre = Antonio\nq\n",
+            "abrir \"{}\"\nprops 2\n{}\nopen \"{}\"\nformato json\nbuscar nombre = Antonio\nq\n",
             ctx.json.display(),
+            index_here(&ctx, "--all"),
             ctx.db.display()
         ),
     ));
@@ -335,14 +386,18 @@ fn abrir_y_open_rutas_con_espacios_desde_sesion_vacia() {
 }
 
 #[test]
-fn recientes_registran_inicio_sidecar_y_comandos_con_rutas_canonicas_distintas() {
+fn recientes_registran_inicio_indice_y_comandos_con_rutas_canonicas_distintas() {
     let ctx = ctx();
     let state = tempfile::tempdir().unwrap();
     let unicode = ctx.dir.path().join("María 東京 con espacios.json");
     fs::write(&unicode, DATA).unwrap();
     clean(&run_raw_with_state(
         &[ctx.json.to_str().unwrap()],
-        &format!("index --batch 2\nabrir \"{}\"\nq\n", unicode.display()),
+        &format!(
+            "{}abrir \"{}\"\nq\n",
+            index_here(&ctx, "--batch 2"),
+            unicode.display()
+        ),
         state.path(),
     ));
     let json_path = ctx.json.canonicalize().unwrap();
@@ -354,7 +409,7 @@ fn recientes_registran_inicio_sidecar_y_comandos_con_rutas_canonicas_distintas()
         "indexar no debe registrar una apertura del índice"
     );
 
-    // Reabrir el JSON con sidecar válido toma el retorno anticipado de open_file.
+    // Reabrir el JSON con índice local válido toma el retorno anticipado de open_file.
     clean(&run_raw_with_state(
         &[ctx.json.to_str().unwrap()],
         "q\n",
@@ -445,7 +500,7 @@ fn index_select_repetible_db_personalizada_y_force() {
     );
     let text = shell_error(&out);
     assert!(String::from_utf8_lossy(&out.stderr).contains("no está indexada"));
-    assert!(db.is_file());
+    assert!(jxcore::is_index_dir(&db));
     assert!(!ctx.db.exists());
     let docs = searches(&text);
     assert_eq!(docs.len(), 2);
@@ -464,26 +519,24 @@ fn index_select_repetible_db_personalizada_y_force() {
 }
 
 #[test]
-fn json_con_sidecar_incompleto_o_obsoleto_no_lo_abre_ni_reindexa() {
+fn indice_incompleto_o_fuente_cambiada_no_se_abre_ni_se_reindexa_solo() {
     for incomplete in [true, false] {
         let ctx = indexed_ctx();
         if incomplete {
-            let conn = rusqlite::Connection::open(&ctx.db).unwrap();
-            assert_eq!(
-                conn.execute("UPDATE meta SET value='running' WHERE key='status'", [])
-                    .unwrap(),
-                1
-            );
+            let path = ctx.db.join(jxcore::store::MANIFEST);
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            manifest["status"] = serde_json::json!("building");
+            fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
         } else {
             fs::write(&ctx.json, format!("{DATA}\n ")).unwrap();
         }
-        let before = fs::read(&ctx.db).unwrap();
+        let before = snapshot(&ctx.db);
         let out = run_file(&ctx.json, "props\nformato json\nnombre = Antonio\nq\n");
         let text = shell_error(&out);
         assert!(text.contains("index"));
         assert!(text.contains("nombre"));
         assert!(searches(&text).is_empty());
-        assert_eq!(fs::read(&ctx.db).unwrap(), before);
+        assert_eq!(snapshot(&ctx.db), before);
     }
 }
 
@@ -614,6 +667,8 @@ fn index_flags_invalidos_no_panico_y_conserva_sesion() {
         "index --batch",
         "index --select",
         "index --db",
+        "index --jobs nope",
+        "index --all --select nombre",
     ];
     let mut input = String::from("limite 1\nformato json\nestado = activo\n");
     for command in invalid {
@@ -683,10 +738,17 @@ fn cambiar_fuente_borra_hits_y_ultima_busqueda() {
     for indexed in [false, true] {
         let second = ctx_with(r#"{"z":{"nombre":"Beatriz","edad":55}}"#);
         if indexed {
-            clean(&run_file(&second.json, "index\nq\n"));
+            clean(&run_file(
+                &second.json,
+                &format!("{}q\n", index_here(&second, "")),
+            ));
         }
         let export = second.dir.path().join("no debe exportarse.json");
-        let index = if indexed { "" } else { "index\n" };
+        let index = if indexed {
+            String::new()
+        } else {
+            index_here(&second, "")
+        };
         let out = run_file(
             &first.db,
             &format!(
@@ -889,7 +951,7 @@ fn ajustes_se_conservan_antes_de_abrir_y_al_cambiar_fuente() {
 fn no_permite_sobrescribir_fuente_o_indice_activo() {
     let ctx = indexed_ctx();
     let source = fs::read(&ctx.json).unwrap();
-    let index = fs::read(&ctx.db).unwrap();
+    let index = snapshot(&ctx.db);
     let out = run_file(
         &ctx.db,
         &format!(
@@ -901,7 +963,7 @@ fn no_permite_sobrescribir_fuente_o_indice_activo() {
     );
     let text = shell_error(&out);
     assert_eq!(fs::read(&ctx.json).unwrap(), source);
-    assert_eq!(fs::read(&ctx.db).unwrap(), index);
+    assert_eq!(snapshot(&ctx.db), index);
     assert!(
         json_documents(&text)
             .iter()
@@ -910,26 +972,138 @@ fn no_permite_sobrescribir_fuente_o_indice_activo() {
 }
 
 #[test]
-fn enlaces_duros_no_permiten_sobrescribir_fuente_o_indice() {
+fn enlaces_duros_no_permiten_sobrescribir_la_fuente() {
     let ctx = indexed_ctx();
     let source = fs::read(&ctx.json).unwrap();
-    let index = fs::read(&ctx.db).unwrap();
+    let index = snapshot(&ctx.db);
     let source_link = ctx.dir.path().join("source-link.json");
-    let index_link = ctx.dir.path().join("index-link.jindex");
     fs::hard_link(&ctx.json, &source_link).unwrap();
-    fs::hard_link(&ctx.db, &index_link).unwrap();
     let out = run_file(
         &ctx.db,
         &format!(
-            "nombre = Antonio\ne 1 \"{}\"\ne 1 \"{}\"\nindex --force --db \"{}\"\nq\n",
+            "nombre = Antonio\ne 1 \"{}\"\nindex --force --db \"{}\"\nq\n",
             source_link.display(),
-            index_link.display(),
             source_link.display()
         ),
     );
     let _ = shell_error(&out);
     assert_eq!(fs::read(&ctx.json).unwrap(), source);
-    assert_eq!(fs::read(&ctx.db).unwrap(), index);
+    assert_eq!(snapshot(&ctx.db), index);
+}
+
+#[test]
+fn jobs_controla_los_fragmentos_y_se_valida() {
+    let ctx = ctx();
+    let text = clean(&run_file(
+        &ctx.json,
+        &format!("{}stats\nq\n", index_here(&ctx, "--jobs 3 --batch 1")),
+    ));
+    assert!(text.contains("3 fragmentos"));
+    let manifest = jxcore::read_manifest(&ctx.db).unwrap();
+    assert_eq!(manifest.shard_count, 3);
+    assert_eq!(manifest.shards.len(), 3);
+    let shards = fs::read_dir(&ctx.db)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("shard-"))
+        .count();
+    assert_eq!(shards, 3);
+
+    let out = run_file(&ctx.db, "index --force --jobs 9999\nq\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--jobs debe estar entre 1 y 64"), "{err}");
+    assert!(out.status.success());
+}
+
+#[test]
+fn almacen_por_defecto_menu_reasociacion_rehacer_y_borrar() {
+    let ctx = ctx();
+    let state = tempfile::tempdir().unwrap();
+    let text = clean(&run_raw_with_state(
+        &[ctx.json.to_str().unwrap()],
+        "index --fts --batch 2\nindices\nq\n",
+        state.path(),
+    ));
+    let dirs = stored_index_dirs(state.path());
+    assert_eq!(dirs.len(), 1);
+    let dir = dirs[0].clone();
+    let manifest = jxcore::read_manifest(&dir).unwrap();
+    assert_eq!(manifest.status, "complete");
+    assert_eq!(manifest.objects, 4);
+    assert!(manifest.fts);
+    assert!(text.contains("Índices guardados en"));
+    assert!(text.contains("4 objetos"));
+    assert!(text.contains("· FTS"));
+
+    // Otro proceso con el mismo almacén abre el JSON y encuentra su índice.
+    let reopened = clean(&run_raw_with_state(
+        &[ctx.json.to_str().unwrap()],
+        "formato json\nnombre = Antonio\nq\n",
+        state.path(),
+    ));
+    let docs = searches(&reopened);
+    assert_eq!(docs.len(), 1);
+    assert_hits(&docs[0], &[0]);
+
+    // `indices abrir <n>` y abrir directamente la carpeta del índice.
+    let reopened = clean(&run_raw_with_state(
+        &[],
+        "indices abrir 1\nformato json\nnombre = Antonio\nq\n",
+        state.path(),
+    ));
+    assert_hits(&searches(&reopened)[0], &[0]);
+    let reopened = clean(&run_raw_with_state(
+        &[dir.to_str().unwrap()],
+        "formato json\nnombre = Antonio\nq\n",
+        state.path(),
+    ));
+    assert_hits(&searches(&reopened)[0], &[0]);
+
+    // Un número inexistente no rompe el shell.
+    let out = run_raw_with_state(&[], "indices abrir 9\nq\n", state.path());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("número 9"));
+
+    // Mover el JSON reasocia el índice por tamaño y huella.
+    let moved = ctx.dir.path().join("movido.json");
+    fs::rename(&ctx.json, &moved).unwrap();
+    let text = clean(&run_raw_with_state(
+        &[moved.to_str().unwrap()],
+        "formato json\nnombre = Antonio\nq\n",
+        state.path(),
+    ));
+    assert_hits(&searches(&text)[0], &[0]);
+    let manifest = jxcore::read_manifest(&dir).unwrap();
+    let expected = moved
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
+    assert_eq!(manifest.source, expected);
+
+    // Rehacer desde el menú tras tocar el JSON.
+    fs::write(&moved, format!("{DATA}\n ")).unwrap();
+    let text = clean(&run_raw_with_state(
+        &[],
+        "indices rehacer 1\nformato json\nnombre = Antonio\nq\n",
+        state.path(),
+    ));
+    assert_hits(&searches(&text)[0], &[0]);
+    assert_eq!(jxcore::read_manifest(&dir).unwrap().status, "complete");
+
+    // Si falta el JSON original, rehacer lo explica y se puede borrar el índice.
+    fs::remove_file(&moved).unwrap();
+    let out = run_raw_with_state(
+        &[],
+        "indices rehacer 1\nindices borrar 1\nindices\nq\n",
+        state.path(),
+    );
+    let text = shell_error(&out);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no encuentro el JSON original"), "{err}");
+    assert!(text.contains("borrado el índice"), "{text}");
+    assert!(!dir.exists());
+    assert!(text.contains("no hay índices guardados"), "{text}");
 }
 
 #[cfg(windows)]

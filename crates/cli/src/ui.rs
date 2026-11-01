@@ -402,8 +402,8 @@ fn document(title: &str, text: &str) -> Result<()> {
 }
 
 fn viewer(session: &super::Session, hit: &jxcore::Hit) -> Result<()> {
-    jxcore::check_source(&session.conn)?;
-    let source = jxcore::index_json_path(&session.conn)?;
+    session.index.check_source()?;
+    let source = session.index.json_path();
     let data = jxcore::read_object(&source, hit.offset as u64, hit.length as u64)?;
     let pretty = jxcore::pretty(&data)?;
     let raw = String::from_utf8_lossy(&data);
@@ -475,7 +475,7 @@ fn browse(shell: &mut Shell, filters: Vec<jxcore::Filter>, any: bool) -> Result<
     for filter in &filters {
         session.require_path(&filter.path)?;
     }
-    let mut results = Results::new(&session.conn, filters.clone(), any, page_size)?;
+    let mut results = Results::new(&session.index, filters.clone(), any, page_size)?;
     session.last = Some((filters, any));
     loop {
         let height = body_height()?;
@@ -519,10 +519,10 @@ fn browse(shell: &mut Shell, filters: Vec<jxcore::Filter>, any: bool) -> Result<
             break;
         }
         let action = match event.code {
-            KeyCode::Down => results.down(&session.conn),
-            KeyCode::Up => results.up(&session.conn),
-            KeyCode::PageDown => results.next_page(&session.conn).map(|_| ()),
-            KeyCode::PageUp => results.previous_page(&session.conn).map(|_| ()),
+            KeyCode::Down => results.down(&session.index),
+            KeyCode::Up => results.up(&session.index),
+            KeyCode::PageDown => results.next_page(&session.index).map(|_| ()),
+            KeyCode::PageUp => results.previous_page(&session.index).map(|_| ()),
             KeyCode::Home => {
                 results.selected = 0;
                 Ok(())
@@ -625,7 +625,7 @@ fn index(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
         2 => {
             let Some(options) = prompt(
                 "Opciones de indexación",
-                "Ejemplo: --select nombre --select edad --fts --batch 50000",
+                "Ejemplo: --select nombre --select edad --fts --jobs 6 --batch 50000",
             )?
             else {
                 return Ok(());
@@ -745,13 +745,17 @@ impl FileBrowser {
         ];
         items.extend(self.entries.iter().map(|entry| {
             let kind = if entry.directory {
-                "Carpeta"
+                if jxcore::is_index_dir(&entry.path) {
+                    "Índice"
+                } else {
+                    "Carpeta"
+                }
             } else if entry
                 .path
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("jindex"))
             {
-                "Índice"
+                "Antiguo índice"
             } else {
                 "JSON"
             };
@@ -895,7 +899,7 @@ fn open_files(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
         };
         let result = result.and_then(|_| {
             if let Some(path) = path {
-                if path.is_dir() {
+                if path.is_dir() && !jxcore::is_index_dir(&path) {
                     browser.enter(&path)?;
                 } else {
                     open_source(shell, terminal, &path)?;
@@ -955,12 +959,107 @@ fn open_recent(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
     }
 }
 
+fn stored_indices(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
+    let mut selected = 0;
+    loop {
+        let entries = jxcore::list_indices()?;
+        if entries.is_empty() {
+            return document(
+                "Índices guardados",
+                "Todavía no hay índices guardados.\n\nAbre un JSON y usa Indexar JSON para crear uno.",
+            );
+        }
+        let items: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                let manifest = &entry.manifest;
+                format!(
+                    "{}{} · {} objetos · {} · {} fragmentos{}",
+                    if manifest.status == "complete" {
+                        ""
+                    } else {
+                        "[incompleto] "
+                    },
+                    display_path(Path::new(&manifest.source)),
+                    fmt(manifest.objects),
+                    super::bytes(entry.bytes),
+                    manifest.shard_count,
+                    if manifest.fts { " · FTS" } else { "" }
+                )
+            })
+            .collect();
+        selected = selected.min(entries.len() - 1);
+        let Some(position) = menu(
+            "Índices guardados",
+            &format!(
+                "{} · Enter/→ elegir · Esc volver",
+                display_path(&jxcore::indexes_root())
+            ),
+            &items,
+            &mut selected,
+        )?
+        else {
+            return Ok(());
+        };
+        let entry = &entries[position];
+        let source = display_path(Path::new(&entry.manifest.source));
+        let Some(action) = choose("Índice guardado", &source, &["Abrir", "Borrar", "Rehacer"])?
+        else {
+            continue;
+        };
+        match action {
+            0 => return open_source(shell, terminal, &entry.dir),
+            1 => {
+                if choose(
+                    "Borrar índice",
+                    "Se borrarán el manifiesto y los fragmentos. El JSON original no se modifica.",
+                    &["Cancelar", "Borrar"],
+                )? != Some(1)
+                {
+                    continue;
+                }
+                if shell
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.dir == entry.dir)
+                {
+                    shell.session = None;
+                }
+                jxcore::remove_index(&entry.dir)?;
+                document(
+                    "Índice borrado",
+                    &format!(
+                        "{}\n\nEl JSON original sigue intacto.",
+                        display_path(&entry.dir)
+                    ),
+                )?;
+            }
+            _ => {
+                if choose(
+                    "Rehacer índice",
+                    "Se sustituirá el índice actual con la misma configuración.",
+                    &["Cancelar", "Rehacer"],
+                )? != Some(1)
+                {
+                    continue;
+                }
+                terminal.suspend()?;
+                let result = shell.reindex(&entry.dir);
+                terminal.resume()?;
+                result?;
+                return Ok(());
+            }
+        }
+    }
+}
+
 fn action(shell: &mut Shell, terminal: &mut Terminal, choice: usize) -> Result<bool> {
     match choice {
         0 => open_files(shell, terminal)?,
         1 => open_recent(shell, terminal)?,
-        2 | 3 => search(shell, choice == 2)?,
-        4 => {
+        2 => stored_indices(shell, terminal)?,
+        3 | 4 => search(shell, choice == 3)?,
+        5 => {
             let (filters, any) = shell
                 .session()?
                 .last
@@ -968,10 +1067,12 @@ fn action(shell: &mut Shell, terminal: &mut Terminal, choice: usize) -> Result<b
                 .context("no hay ninguna búsqueda anterior")?;
             browse(shell, filters, any)?;
         }
-        5 => index(shell, terminal)?,
-        6 => {
+        6 => index(shell, terminal)?,
+        7 => {
             let text = if let Some(session) = &shell.session {
-                jxcore::stats(&session.conn)?
+                session
+                    .index
+                    .stats()
                     .paths
                     .iter()
                     .map(|(path, count)| format!("{path}    {} apariciones", fmt(*count)))
@@ -994,23 +1095,25 @@ fn action(shell: &mut Shell, terminal: &mut Terminal, choice: usize) -> Result<b
             };
             document("Propiedades", &text)?;
         }
-        7 => {
+        8 => {
             let session = shell.session()?;
-            let stats = jxcore::stats(&session.conn)?;
+            let stats = session.index.stats();
             document(
                 "Estadísticas",
                 &format!(
-                    "JSON: {}\nObjetos: {}\nEstado: {}\nFTS: {}\nÍndice: {}\nTamaño JSON: {}",
+                    "JSON: {}\nObjetos: {}\nEstado: {}\nFTS: {}\nÍndice: {} · {} fragmentos\nCarpeta: {}\nTamaño JSON: {}",
                     stats.json_path.display(),
                     fmt(stats.objects),
                     stats.status,
                     if stats.fts { "sí" } else { "no" },
-                    session.db.display(),
+                    super::bytes(stats.index_bytes),
+                    stats.shards,
+                    stats.dir.display(),
                     super::bytes(stats.size)
                 ),
             )?;
         }
-        8 => {
+        9 => {
             let session = shell.session()?;
             if let Some(property) = menu(
                 "Valores frecuentes",
@@ -1018,7 +1121,7 @@ fn action(shell: &mut Shell, terminal: &mut Terminal, choice: usize) -> Result<b
                 &session.props,
                 &mut 0,
             )? {
-                let text = jxcore::group_by(&session.conn, &session.props[property], 100)?
+                let text = jxcore::group_by(&session.index, &session.props[property], 100)?
                     .iter()
                     .map(|group| {
                         format!(
@@ -1033,10 +1136,10 @@ fn action(shell: &mut Shell, terminal: &mut Terminal, choice: usize) -> Result<b
                 document("Valores frecuentes · primeros 100", &text)?;
             }
         }
-        9 => {
+        10 => {
             terminal.command(shell, "verify")?;
         }
-        10 => {
+        11 => {
             if let Some(setting) = choose(
                 "Ajustes",
                 "Se conservan al cambiar de fuente",
@@ -1064,10 +1167,10 @@ fn action(shell: &mut Shell, terminal: &mut Terminal, choice: usize) -> Result<b
                 }
             }
         }
-        11 => {
+        12 => {
             if let Some(line) = prompt(
                 "Comandos del shell",
-                "Consulta, abrir, index, count, top, id, key, export, formato, limite, ayuda o q",
+                "Consulta, abrir, index, indices, count, top, id, key, export, formato, limite, ayuda o q",
             )? {
                 if super::looks_like_query(&line)
                     || matches!(
@@ -1098,9 +1201,9 @@ fn action(shell: &mut Shell, terminal: &mut Terminal, choice: usize) -> Result<b
                 }
             }
         }
-        12 => document(
+        13 => document(
             "Ayuda",
-            "MENÚS\n↑/↓ seleccionan, Enter o → abren, ← o Esc vuelven.\n\nARCHIVOS\nAbrir JSON o índice explora carpetas; ← o Retroceso suben a la carpeta superior.\nPuedes escribir o pegar una ruta, entrecomillada o no, y elegir otra unidad.\nAbiertos recientemente conserva las últimas 20 aperturas entre sesiones.\n\nCOINCIDENCIAS\nLas flechas recorren todas las coincidencias, cargando solo una página.\nRePág/AvPág cambian de página; Inicio/Fin seleccionan sus extremos.\nEnter o → abren el objeto; ← vuelve al mismo resultado.\n\nVISOR\n↑/↓ y RePág/AvPág desplazan todo el objeto, sin límite de 200 líneas.\nr alterna JSON formateado/original; e exporta los bytes originales.\n\nCONSULTAS\nedad >= 30 & ciudad = Madrid\nnombre ~i maria\nnota !?\nSepara & y | con espacios; no se pueden mezclar.\n\nINDEXACIÓN\nAbrir un JSON no lo indexa automáticamente. Usa Indexar JSON.\nFTS acelera búsquedas de texto, pero ocupa más espacio.\n\nTodos los comandos anteriores siguen disponibles en Comandos del shell.\nCon entrada o salida redirigida se usa el shell textual, sin menús.",
+            "MENÚS\n↑/↓ seleccionan, Enter o → abren, ← o Esc vuelven.\n\nARCHIVOS\nAbrir JSON o índice explora carpetas; ← o Retroceso suben a la carpeta superior.\nPuedes escribir o pegar una ruta, entrecomillada o no, y elegir otra unidad.\nAbiertos recientemente conserva las últimas 20 aperturas entre sesiones.\n\nÍNDICES\nLos índices se guardan en la carpeta de datos de la aplicación, no junto al JSON.\nÍndices guardados permite abrirlos, borrarlos o rehacerlos.\n\nCOINCIDENCIAS\nLas flechas recorren todas las coincidencias, cargando solo una página.\nRePág/AvPág cambian de página; Inicio/Fin seleccionan sus extremos.\nEnter o → abren el objeto; ← vuelve al mismo resultado.\n\nVISOR\n↑/↓ y RePág/AvPág desplazan todo el objeto, sin límite de 200 líneas.\nr alterna JSON formateado/original; e exporta los bytes originales.\n\nCONSULTAS\nedad >= 30 & ciudad = Madrid\nnombre ~i maria\nnota !?\nSepara & y | con espacios; no se pueden mezclar.\n\nINDEXACIÓN\nAbrir un JSON no lo indexa automáticamente. Usa Indexar JSON.\nEl índice se reparte en fragmentos que se crean en paralelo (--jobs).\nFTS acelera búsquedas de texto, pero ocupa más espacio.\n\nTodos los comandos anteriores siguen disponibles en Comandos del shell.\nCon entrada o salida redirigida se usa el shell textual, sin menús.",
         )?,
         _ => return Ok(true),
     }
@@ -1123,6 +1226,7 @@ pub(super) fn run(file: Option<&Path>) -> Result<()> {
     let items = [
         "Abrir JSON o índice",
         "Abiertos recientemente",
+        "Índices guardados",
         "Buscar por propiedad",
         "Escribir consulta",
         "Última búsqueda",

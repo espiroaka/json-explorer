@@ -119,7 +119,7 @@ anterior.
 | `props N` | Descubre propiedades usando una muestra de N objetos del JSON. |
 | `index [OPCIONES]` | Indexa la fuente y la deja lista para buscar; por defecto, todas las propiedades. |
 | `indices` | Lista los índices guardados: objetos, tamaño, fragmentos y avisos (`FTS`, `incompleto`, `formato antiguo`). |
-| `indices abrir\|borrar\|rehacer N` | Abre, elimina o rehace el índice número N de esa lista (más reciente primero; `N` empieza en 1). |
+| `indices abrir\|borrar\|rehacer N` | Abre, elimina o rehace el índice número N de esa lista (más reciente primero; `N` empieza en 1). `rehacer` admite `--cpus`, `--jobs` y `--low-priority`. |
 | `PROP OP VALOR` / `buscar CONSULTA` | Busca; admite varios filtros con el mismo conector `&` o `\|`. |
 | `count [CONSULTA]` | Cuenta una consulta nueva o la última búsqueda sin cambiar sus hits ni su página. |
 | `n` | Siguiente página de la búsqueda activa. |
@@ -143,7 +143,8 @@ fichero inicial termina con código 1.
 Un índice es una **carpeta** con `manifest.json` y sus fragmentos `shard-XXX.jxdb`:
 los objetos se reparten entre los fragmentos por id y las búsquedas los recorren todos.
 El número de fragmentos lo fija `--jobs`; sin esa opción se eligen según los núcleos
-disponibles (entre 2 y 8).
+disponibles (entre 2 y 8), y `--cpus N` recorta cuántos núcleos puede usar la
+construcción.
 
 Por defecto `index` escribe en el almacén, bajo `indexes\<nombre>-<hash>`:
 
@@ -172,6 +173,7 @@ Estos comandos se ejecutan **dentro del shell**:
 index
 index --select nombre --select ciudad
 index --all --fts --batch 50000
+index --all --cpus 2 --low-priority
 index --db "C:\indices\datos.jindex"
 index --force --all --fts
 ```
@@ -180,6 +182,15 @@ index --force --all --fts
 - `--fts` añade FTS5 con tokenizador trigram para búsquedas de texto.
 - `--batch N` establece los objetos por transacción; debe ser positivo.
 - `--jobs N` fija cuántos fragmentos se escriben (1 a 64); se indexan en paralelo.
+- `--cpus N` limita a N los núcleos que puede usar la construcción (0, por defecto, usa
+  todos): se ajustan los fragmentos y los hilos de índice para no pasar de ese número.
+  `--cpus 1` es el modo «no molesto»; tarda bastante más a cambio de dejar el equipo libre.
+  Si además fijas `--jobs`, ese mandato gana: `--cpus` solo recorta el reparto automático.
+- `--low-priority` (o `--baja-prioridad`) baja la prioridad del proceso mientras indexa,
+  de modo que las aplicaciones abiertas ganan siempre el CPU; al terminar se restaura.
+- `indices rehacer N` repite la configuración guardada en el manifiesto y acepta estas
+  mismas opciones: `indices rehacer 2 --cpus 4 --low-priority`. En el menú **Índices
+  guardados**, «Rehacer gastando menos CPU» escribe ese comando por ti.
 - `--db CARPETA` elige dónde se guarda el índice; la crea si falta y, sin esa opción,
   se usa el almacén (ver **Dónde vive el índice**). Rehacer un índice abierto conserva
   su ruta.

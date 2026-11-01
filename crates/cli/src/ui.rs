@@ -813,7 +813,7 @@ fn index(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
         2 => {
             let Some(options) = prompt(
                 "Opciones de indexación",
-                "Ejemplo: --select nombre --select edad --fts --jobs 6 --batch 50000",
+                "Ejemplo: --select nombre --select edad --fts --cpus 4 --low-priority --jobs 6",
             )?
             else {
                 return Ok(());
@@ -1233,18 +1233,31 @@ fn stored_indices(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
                 )?;
             }
             _ => {
-                if choose(
+                let Some(rehacer) = choose(
                     "Rehacer índice",
                     "Se sustituirá el índice actual con la misma configuración.",
-                    &["Cancelar", "Rehacer"],
-                )? != Some(1)
-                {
+                    &["Cancelar", "Rehacer", "Rehacer gastando menos CPU"],
+                )?
+                else {
+                    continue;
+                };
+                if rehacer == 0 {
                     continue;
                 }
-                terminal.suspend()?;
-                let result = shell.reindex(&entry.dir);
-                terminal.resume()?;
-                result?;
+                let opciones = if rehacer == 1 {
+                    String::new()
+                } else {
+                    let Some(options) = prompt(
+                        "Opciones de rehacer",
+                        "Ejemplo: --cpus 4 --low-priority --jobs 2",
+                    )?
+                    else {
+                        continue;
+                    };
+                    options
+                };
+                let command = format!("indices rehacer {} {opciones}", position + 1);
+                terminal.command(shell, &command)?;
                 return Ok(());
             }
         }

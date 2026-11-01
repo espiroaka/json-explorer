@@ -346,6 +346,7 @@ name = "jxcore"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "libc",
  "memchr",
  "regex",
  "rusqlite",
@@ -353,6 +354,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "unicode-normalization",
+ "windows-sys",
 ]
 
 [[package]]

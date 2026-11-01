@@ -387,7 +387,13 @@ fn fast_plan(f: &Filter, pid: Option<i64>, fts: Option<i64>) -> Result<Option<Pl
             if raw_value.starts_with('{') || raw_value.starts_with('[') {
                 return Ok(None);
             }
-            let mut predicate = "p.type IN (0,1,2,3) AND p.norm = ?".to_string();
+            // El índice parcial deja fuera los null, cuyo `norm` también es «null»:
+            // quien pregunta por esa palabra tiene que pasar por el plan general
+            // para seguir recibiendo los valores nulos del JSON.
+            if folded == "null" {
+                return Ok(None);
+            }
+            let mut predicate = "p.type IN (0,1,2) AND p.norm = ?".to_string();
             let mut args = vec![int(pid), text(folded)];
             if !f.fold {
                 predicate.push_str(" AND COALESCE(p.value,p.norm) = ?");

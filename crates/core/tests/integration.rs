@@ -26,7 +26,9 @@ fn options(all: bool, fts: bool, batch: usize, jobs: usize) -> IndexOptions {
         all,
         fts,
         batch,
+        cpus: 0,
         jobs,
+        low_priority: false,
         force: false,
     }
 }
@@ -176,6 +178,81 @@ fn rangos_nulos_existencias_y_regex() {
         one(&index, "nombre", Op::Contains, val("ant"), false),
         Vec::<i64>::new()
     );
+}
+
+#[test]
+fn igualar_la_palabra_null_sigue_encontrando_los_nulos() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = r#"{
+      "a": {"dato":null,"nombre":"uno"},
+      "b": {"dato":"null","nombre":"dos"},
+      "c": {"dato":"x","nombre":"tres"},
+      "d": {"nombre":"cuatro"}
+    }"#;
+    let (_, db) = build_json(dir.path(), "data.json", data, &options(true, false, 2, 2));
+    let index = open(&db);
+
+    // El índice parcial deja fuera los nulos, así que esta pregunta va por el plan
+    // general y sigue viendo tanto el `null` del JSON como la cadena «null».
+    assert_eq!(one(&index, "dato", Op::Eq, val("null"), false), vec![0, 1]);
+    assert_eq!(one(&index, "dato", Op::Eq, val("NULL"), true), vec![0, 1]);
+    assert_eq!(one(&index, "dato", Op::Null, None, false), vec![0]);
+    // Las demás igualidades siguen usando el índice parcial.
+    assert_eq!(one(&index, "dato", Op::Eq, val("x"), false), vec![2]);
+    assert_eq!(one(&index, "dato", Op::Missing, None, false), vec![3]);
+}
+
+#[test]
+fn limitar_nucleos_no_cambia_lo_que_se_encuentra() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = dir.path().join("data.json");
+    fs::write(&json, DATA).unwrap();
+
+    let mut opts = options(true, false, 2, 0);
+    opts.cpus = 1;
+    opts.low_priority = true;
+    let uno = dir.path().join("uno");
+    let resumen = jxcore::build_index(&json, &uno, &opts, |_| {}).unwrap();
+    assert_eq!(resumen.shards, 1);
+
+    let opts = options(true, false, 2, 0);
+    let todos = dir.path().join("todos");
+    jxcore::build_index(&json, &todos, &opts, |_| {}).unwrap();
+
+    for db in [&uno, &todos] {
+        let index = open(db);
+        let where_ = db.display().to_string();
+        assert_eq!(
+            one(&index, "nombre", Op::Eq, val("antonio"), true),
+            vec![0],
+            "{where_}"
+        );
+        assert_eq!(
+            one(&index, "dato", Op::Null, None, false),
+            vec![0],
+            "{where_}"
+        );
+        assert_eq!(
+            one(&index, "ciudad", Op::Eq, val("Madrid"), false).len(),
+            2,
+            "{where_}"
+        );
+    }
+}
+
+#[test]
+fn cpus_demasiado_altos_se_rechazan_y_no_dejan_indice() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = dir.path().join("data.json");
+    fs::write(&json, DATA).unwrap();
+    let mut opts = options(true, false, 2, 0);
+    opts.cpus = jxcore::available_cores() + 1;
+    let db = dir.path().join("indice");
+    let error = jxcore::build_index(&json, &db, &opts, |_| {})
+        .err()
+        .expect("--cpus por encima de los núcleos debe fallar");
+    assert!(error.to_string().contains("--cpus"), "mensaje: {error}");
+    assert!(!db.exists());
 }
 
 #[test]
@@ -991,7 +1068,9 @@ fn lotes_pequenos_y_fts_conservan_propiedades() {
                     all,
                     fts,
                     batch,
+                    cpus: 0,
                     jobs: 2,
+                    low_priority: false,
                     force: false,
                 };
                 let summary = jxcore::build_index(&json, &db, &opts, |_| {}).unwrap();
@@ -1072,7 +1151,9 @@ fn cada_fragmento_tiene_indices_y_se_rehace_con_force() {
                 all: true,
                 fts: false,
                 batch,
+                cpus: 0,
                 jobs: 2,
+                low_priority: false,
                 force: false,
             };
             let summary = jxcore::build_index(&json, &db, &opts, |_| {}).unwrap();

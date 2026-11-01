@@ -1203,6 +1203,50 @@ fn indices_marcan_el_formato_antiguo_y_rehacer_lo_renueva() {
     assert_hits(&searches(&text)[0], &[0]);
 }
 
+#[test]
+fn rehacer_acepta_las_opciones_de_cpu() {
+    let ctx = ctx();
+    let state = tempfile::tempdir().unwrap();
+    clean(&run_raw_with_state(
+        &[ctx.json.to_str().unwrap()],
+        "index\nq\n",
+        state.path(),
+    ));
+
+    // el `--cpus` de `indices rehacer` llega al núcleo: por encima de los núcleos falla
+    let out = run_raw_with_state(
+        &[],
+        &format!(
+            "indices rehacer 1 --cpus {}\nq\n",
+            jxcore::available_cores() + 1
+        ),
+        state.path(),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--cpus"), "{err}");
+
+    // y con valores razonables rehace y deja el índice operativo
+    clean(&run_raw_with_state(
+        &[],
+        "indices rehacer 1 --cpus 1 --low-priority\nq\n",
+        state.path(),
+    ));
+    let text = clean(&run_raw_with_state(
+        &[],
+        "indices abrir 1\nformato json\nnombre = Antonio\nq\n",
+        state.path(),
+    ));
+    assert_hits(&searches(&text)[0], &[0]);
+
+    let help = clean(&run_raw_with_state(
+        &[],
+        "indices rehacer --help\nq\n",
+        state.path(),
+    ));
+    assert!(help.contains("--cpus"), "{help}");
+    assert!(help.contains("--low-priority"), "{help}");
+}
+
 #[cfg(windows)]
 #[test]
 fn rutas_windows_con_backslashes_para_abrir_index_y_exportar() {

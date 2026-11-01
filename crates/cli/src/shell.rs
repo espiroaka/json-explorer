@@ -113,14 +113,39 @@ struct IndexArgs {
     fts: bool,
     #[arg(long, default_value_t = 20000)]
     batch: usize,
+    /// Núcleos con los que se reparten fragmentos e hilos (0 = todos)
+    #[arg(long, default_value_t = 0)]
+    cpus: usize,
     /// Número de fragmentos y de hilos de indexación (0 = automático)
     #[arg(long, default_value_t = 0)]
     jobs: usize,
+    /// Indexar con prioridad de proceso baja, cediendo ante las apps abiertas
+    #[arg(long, visible_alias = "baja-prioridad")]
+    low_priority: bool,
     /// Carpeta del índice (por defecto, el almacén de la aplicación)
     #[arg(long)]
     db: Option<PathBuf>,
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rehacer",
+    about = "Rehace un índice guardado manteniendo su configuración"
+)]
+struct ReindexArgs {
+    /// Número de índice, empezando por 1
+    numero: usize,
+    /// Núcleos con los que se reparten fragmentos e hilos (0 = todos)
+    #[arg(long, default_value_t = 0)]
+    cpus: usize,
+    /// Número de fragmentos y de hilos de indexación (0 = automático)
+    #[arg(long, default_value_t = 0)]
+    jobs: usize,
+    /// Indexar con prioridad de proceso baja, cediendo ante las apps abiertas
+    #[arg(long, visible_alias = "baja-prioridad")]
+    low_priority: bool,
 }
 
 enum Next {
@@ -334,13 +359,15 @@ impl Shell {
             select: args.select,
             fts: args.fts,
             batch: args.batch,
+            cpus: args.cpus,
             jobs: args.jobs,
+            low_priority: args.low_priority,
             force: args.force,
         };
         self.build(&source, &dir, opts)
     }
 
-    fn reindex(&mut self, dir: &Path) -> Result<()> {
+    fn reindex(&mut self, dir: &Path, cpus: usize, jobs: usize, low_priority: bool) -> Result<()> {
         let manifest = jxcore::read_manifest(dir)?;
         let source = PathBuf::from(&manifest.source);
         if !source.is_file() {
@@ -358,7 +385,9 @@ impl Shell {
             },
             fts: manifest.fts,
             batch: 20_000,
-            jobs: 0,
+            cpus,
+            jobs,
+            low_priority,
             force: true,
         };
         self.json = Some(source.clone());
@@ -377,6 +406,19 @@ impl Shell {
             terminal_text(source.display().to_string()),
             terminal_text(dir.display().to_string())
         );
+        if opts.cpus > 0 || opts.low_priority {
+            let mut modo = String::from("      ");
+            if opts.cpus > 0 {
+                modo.push_str(&format!("{} núcleos como máximo", opts.cpus));
+            }
+            if opts.low_priority {
+                if opts.cpus > 0 {
+                    modo.push_str(" · ");
+                }
+                modo.push_str("prioridad baja");
+            }
+            eprintln!("{modo}");
+        }
         let mut last = Instant::now();
         let mut last_phase: Option<Phase> = None;
         let mut announced_fts = false;
@@ -574,16 +616,31 @@ impl Shell {
                 );
                 Ok(())
             }
-            "rehacer" | "reindexar" => {
-                let entry = self.stored_index(parse_index_pos(arg)?)?;
-                self.reindex(&entry.dir)
-            }
+            "rehacer" | "reindexar" => self.rehacer(arg),
             other if other.parse::<usize>().is_ok() => {
                 let entry = self.stored_index(parse_index_pos(rest)?)?;
                 self.open(&entry.dir)
             }
-            _ => bail!("uso: indices [abrir|borrar|rehacer <n>]"),
+            _ => bail!(
+                "uso: indices [abrir|borrar|rehacer <n>] · rehacer admite --cpus y --low-priority"
+            ),
         }
+    }
+
+    fn rehacer(&mut self, rest: &str) -> Result<()> {
+        let tokens = tokenize(rest)?;
+        let args = match ReindexArgs::try_parse_from(
+            std::iter::once("rehacer").chain(tokens.iter().map(|t| t.text.as_str())),
+        ) {
+            Ok(args) => args,
+            Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {
+                print!("{e}");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let entry = self.stored_index(args.numero)?;
+        self.reindex(&entry.dir, args.cpus, args.jobs, args.low_priority)
     }
 
     fn list_indices(&self) -> Result<()> {
@@ -1089,8 +1146,10 @@ abrir <fichero>  abrir JSON o carpeta de índice (open)
 props [n]        propiedades indexadas, o muestra del JSON si aún no hay índice
 index            indexar todas las propiedades del JSON abierto
                  --select PROP (repetible), --all, --fts, --batch N, --jobs N
+                 --cpus N (0 = todos) y --low-priority para gastar menos CPU
                  --db CARPETA para elegir dónde guardar; --force para rehacer
 indices          índices guardados; `indices abrir|borrar|rehacer <n>`
+                 `indices rehacer <n>` también admite --cpus y --low-priority
 consulta         nombre = Antonio       valor exacto
                  nombre =i antonio      sin mayúsculas ni acentos
                  nombre != Antonio      distinto (!=i con plegado)

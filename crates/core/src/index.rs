@@ -17,7 +17,7 @@ use crate::parser::{CHUNK, MemberIdx, RootScanner, object_members};
 use crate::store::{self, Manifest, ShardInfo};
 use crate::text::fold;
 
-pub const FORMAT_VERSION: i64 = 7;
+pub const FORMAT_VERSION: i64 = 8;
 pub const MAX_STORED_NESTED: usize = 4096;
 
 pub const T_STRING: i64 = 0;
@@ -46,11 +46,14 @@ pub fn type_name(t: i64) -> &'static str {
     }
 }
 
-pub fn auto_jobs() -> usize {
+pub fn available_cores() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(2)
-        .clamp(2, 8)
+        .unwrap_or(1)
+}
+
+pub fn auto_jobs() -> usize {
+    available_cores().clamp(2, 8)
 }
 
 pub struct IndexOptions {
@@ -58,8 +61,12 @@ pub struct IndexOptions {
     pub all: bool,
     pub fts: bool,
     pub batch: usize,
+    /// Número máximo de núcleos que puede usar la construcción; 0 = todos.
+    pub cpus: usize,
     /// 0 elige un valor según los núcleos disponibles.
     pub jobs: usize,
+    /// Construir con prioridad de proceso baja para no competir con el usuario.
+    pub low_priority: bool,
     pub force: bool,
 }
 
@@ -656,7 +663,10 @@ fn run_worker(args: WorkerArgs) -> Result<ShardDone> {
         conn.execute_batch("PRAGMA temp_store=FILE;")?;
         conn.pragma_update(None, "threads", index_threads)?;
         let indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_props_search ON props(path_id, norm, object_id) WHERE type IN (0,1,2,3)",
+            // Los null (type 3) se quedan fuera: su `norm` es siempre «null», así
+            // que indexarlos añade un 8% de filas que ninguna búsqueda igualitaria
+            // necesita. `x = null` se resuelve por el plan general, que sí los ve.
+            "CREATE INDEX IF NOT EXISTS idx_props_search ON props(path_id, norm, object_id) WHERE type IN (0,1,2)",
             "CREATE INDEX IF NOT EXISTS idx_objects_key ON objects(root_key)",
         ];
         for sql in indexes {
@@ -781,8 +791,13 @@ pub fn build_index(
     if opts.batch == 0 || opts.batch > MAX_BATCH {
         bail!("--batch debe estar entre 1 y {MAX_BATCH}");
     }
+    let cores = available_cores();
+    if opts.cpus > cores {
+        bail!("--cpus debe estar entre 1 y {cores}, o 0 para usar todos");
+    }
+    let budget = if opts.cpus == 0 { cores } else { opts.cpus };
     let jobs = if opts.jobs == 0 {
-        auto_jobs()
+        auto_jobs().min(budget)
     } else {
         opts.jobs
     };
@@ -792,6 +807,7 @@ pub fn build_index(
     if dir.is_file() {
         bail!("la ruta del índice debe ser una carpeta: {}", dir.display());
     }
+    let _priority = crate::priority::LowPriority::set(opts.low_priority);
 
     let abs_json = fs::canonicalize(json).unwrap_or_else(|_| json.to_path_buf());
     let abs_json_str = store::stored_path(&abs_json);
@@ -886,10 +902,7 @@ pub fn build_index(
         connections.push(conn);
     }
 
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let index_threads = (cores / jobs).clamp(1, 8) as i64;
+    let index_threads = (budget / jobs).clamp(1, 8) as i64;
     let selected: Arc<FastSet<String>> = Arc::new(opts.select.iter().cloned().collect());
     let counts = Arc::new(Mutex::new(vec![0u64; jobs]));
     let barrier = Arc::new(Barrier::new(jobs));

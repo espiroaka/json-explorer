@@ -607,7 +607,7 @@ impl Shell {
                 manifest.props.join(", ")
             };
             println!(
-                "{:>2}. {} · {} objetos · {}{}",
+                "{:>2}. {} objetos · {}{}{}{}",
                 position + 1,
                 fmt(manifest.objects),
                 bytes(entry.bytes),
@@ -616,6 +616,11 @@ impl Shell {
                     ""
                 } else {
                     " · incompleto"
+                },
+                if outdated(manifest) {
+                    " · formato antiguo"
+                } else {
+                    ""
                 }
             );
             println!(
@@ -625,6 +630,11 @@ impl Shell {
             );
         }
         println!("\nUsa `indices abrir <n>`, `indices borrar <n>` o `indices rehacer <n>`.");
+        if entries.iter().any(|entry| outdated(&entry.manifest)) {
+            println!(
+                "Los de «formato antiguo» no se pueden abrir; rehazlos con `indices rehacer <n>`."
+            );
+        }
         Ok(())
     }
 
@@ -910,17 +920,38 @@ impl Session {
 
     fn top(&self, rest: &str, output: OutputOptions) -> Result<()> {
         let tokens = tokenize(rest)?;
-        if tokens.is_empty() || tokens.len() > 2 {
-            bail!("uso: top <propiedad> [n]");
+        if tokens.is_empty() {
+            bail!("uso: top <propiedad> [n] [consulta]");
         }
         let path = &tokens[0].text;
         self.require_path(path)?;
+        let mut from = 1;
         let limit = match tokens.get(1) {
-            Some(token) => token.text.parse().context("el límite no es un número")?,
-            None => 10,
+            Some(token) if !token.quoted && token.text.parse::<usize>().is_ok() => {
+                from = 2;
+                token.text.parse()?
+            }
+            _ => 10,
         };
         check_limit(limit)?;
-        let groups = jxcore::group_by(&self.index, path, limit)?;
+        let query = if tokens.len() > from {
+            let (filters, any) = parse_query_from_tokens(&tokens[from..])?;
+            for filter in &filters {
+                self.require_path(&filter.path)?;
+            }
+            Some(jxcore::SearchQuery {
+                filters,
+                any,
+                limit: output.limit,
+                after: None,
+            })
+        } else {
+            None
+        };
+        let groups = match &query {
+            Some(query) => jxcore::group_matching(&self.index, path, query, limit)?,
+            None => jxcore::group_by(&self.index, path, limit)?,
+        };
         match output.format {
             "json" => {
                 let rows: Vec<_> = groups.iter().map(|g| json!({ "value": g.value, "type": jxcore::type_name(g.kind), "count": g.count })).collect();
@@ -939,6 +970,9 @@ impl Session {
                 }
             }
             _ => {
+                if let Some(query) = &query {
+                    println!("{} coincidencias", fmt(jxcore::count(&self.index, query)?));
+                }
                 let w = groups
                     .iter()
                     .map(|g| g.value.chars().count())
@@ -1078,12 +1112,18 @@ raw <n>         abrir el resultado n tal cual está en el fichero (r)
 id <id>         abrir por id interno
 key <clave>     abrir por clave raíz (k)
 top <prop> [n]  valores más frecuentes
+                si añades una consulta, cuenta solo en sus coincidencias
 e <n> <fichero> exportar el resultado n a un fichero
 verify [n]      verificar el índice (por defecto 1000; 0 = todos)
 stats           datos del índice
 ayuda           esta ayuda
 q               salir"
     );
+}
+
+/// Índices escritos con una versión del formato anterior al actual: solo sirven para rehacerlos.
+fn outdated(manifest: &jxcore::Manifest) -> bool {
+    manifest.format != jxcore::FORMAT_VERSION
 }
 
 fn print_capped(text: &str) {
@@ -1163,7 +1203,12 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
 }
 
 fn parse_query(s: &str) -> Result<(Vec<Filter>, bool)> {
-    let tokens = tokenize(s)?;
+    parse_query_from_tokens(&tokenize(s)?)
+}
+
+/// Igual que `parse_query`, pero sobre tokens ya separados: evita recomponer
+/// las comillas cuando la consulta es la cola de otro comando.
+fn parse_query_from_tokens(tokens: &[Token]) -> Result<(Vec<Filter>, bool)> {
     let mut filters = Vec::new();
     let mut connector = None;
     let mut start = 0;
@@ -1483,5 +1528,56 @@ mod tests {
         let (filters, _) = parse_query(r#"nombre = "Dijo ""hola""""#).unwrap();
         assert_eq!(filters[0].value.as_deref(), Some("Dijo \"hola\""));
         assert!(tokenize("\"sin cierre").is_err());
+    }
+
+    /// Reparte los argumentos de `top <propiedad> [n] [consulta]` como lo hace el comando.
+    fn divide_top(rest: &str) -> (usize, Vec<String>, bool) {
+        let tokens = tokenize(rest).unwrap();
+        let mut from = 1;
+        let limit = match tokens.get(1) {
+            Some(token) if !token.quoted && token.text.parse::<usize>().is_ok() => {
+                from = 2;
+                token.text.parse().unwrap()
+            }
+            _ => 10,
+        };
+        let (filters, any) = if tokens.len() > from {
+            parse_query_from_tokens(&tokens[from..]).unwrap()
+        } else {
+            (Vec::new(), false)
+        };
+        (
+            limit,
+            filters.iter().map(jxcore::Filter::describe).collect(),
+            any,
+        )
+    }
+
+    #[test]
+    fn top_reconstruye_la_consulta_sin_perder_comillas() {
+        assert_eq!(divide_top("provincia"), (10, vec![], false));
+        assert_eq!(divide_top("provincia 3"), (3, vec![], false));
+        assert_eq!(
+            divide_top("provincia 3 sexo = M & nombre ~ \"San Miguel\""),
+            (
+                3,
+                vec!["sexo = M".to_string(), "nombre ~ San Miguel".to_string()],
+                false
+            )
+        );
+        // un segundo token que no es número ya forma parte de la consulta
+        assert_eq!(
+            divide_top("provincia sexo = M | edad > 30"),
+            (
+                10,
+                vec!["sexo = M".to_string(), "edad > 30".to_string()],
+                true
+            )
+        );
+        // & y | literales entre comillas no parten la consulta
+        assert_eq!(
+            divide_top("nombre 2 valor = \"a & b\""),
+            (2, vec!["valor = a & b".to_string()], false)
+        );
     }
 }

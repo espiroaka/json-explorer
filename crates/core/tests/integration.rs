@@ -605,6 +605,152 @@ fn groupby_y_acceso_por_clave() {
 }
 
 #[test]
+fn agrupa_dentro_de_las_coincidencias() {
+    let (_dir, db) = setup();
+    let index = open(&db);
+    let query = move |filters: Vec<Filter>, any: bool| SearchQuery {
+        filters,
+        any,
+        limit: 100,
+        after: None,
+    };
+    let tabla = |groups: Vec<jxcore::Group>| -> Vec<(String, u64)> {
+        groups.into_iter().map(|g| (g.value, g.count)).collect()
+    };
+
+    assert_eq!(
+        tabla(jxcore::group_by(&index, "ciudad", 10).unwrap()),
+        vec![
+            ("Madrid".to_string(), 2),
+            ("Cuenca".to_string(), 1),
+            ("Toledo".to_string(), 1)
+        ]
+    );
+
+    let mayores = jxcore::group_matching(
+        &index,
+        "ciudad",
+        &query(
+            vec![Filter::new("edad", Op::Gt, Some("20".to_string()), false)],
+            false,
+        ),
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        tabla(mayores),
+        vec![("Madrid".to_string(), 2), ("Toledo".to_string(), 1)]
+    );
+
+    let mezclada = jxcore::group_matching(
+        &index,
+        "ciudad",
+        &query(
+            vec![
+                Filter::new("estado", Op::Eq, Some("baja".to_string()), true),
+                Filter::new("nombre", Op::Eq, Some("MARÍA".to_string()), false),
+            ],
+            true,
+        ),
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        tabla(mezclada),
+        vec![("Cuenca".to_string(), 1), ("Madrid".to_string(), 1)]
+    );
+}
+
+#[test]
+fn omite_el_valor_cuando_coincide_con_norm() {
+    let (_dir, db) = setup();
+    let index = open(&db);
+
+    let mut omitidos = 0i64;
+    let mut duplicados = 0i64;
+    for conn in index.shards() {
+        omitidos += conn
+            .query_row("SELECT count(*) FROM props WHERE value IS NULL", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        duplicados += conn
+            .query_row(
+                "SELECT count(*) FROM props WHERE value IS NOT NULL AND value = norm",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        // "nombre" siempre lleva mayúsculas o acentos: nunca es redundante.
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM props p JOIN paths pa ON pa.id=p.path_id
+                 WHERE pa.path='nombre' AND p.value IS NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        // "estado" ya está plegado: su valor nunca se duplica.
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM props p JOIN paths pa ON pa.id=p.path_id
+                 WHERE pa.path='estado' AND p.value IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+    assert!(omitidos > 0);
+    assert_eq!(duplicados, 0);
+
+    let valores = |filters: Vec<Filter>| -> Vec<String> {
+        jxcore::search(
+            &index,
+            &SearchQuery {
+                filters,
+                any: false,
+                limit: 10,
+                after: None,
+            },
+        )
+        .unwrap()
+        .iter()
+        .map(|hit| hit.value.clone())
+        .collect()
+    };
+    assert_eq!(
+        valores(vec![Filter::new(
+            "nombre",
+            Op::Eq,
+            Some("MARÍA".to_string()),
+            false
+        )]),
+        vec!["MARÍA"]
+    );
+    assert_eq!(
+        valores(vec![Filter::new(
+            "nombre",
+            Op::Eq,
+            Some("maria".to_string()),
+            true
+        )]),
+        vec!["MARÍA"]
+    );
+    let mut numeros = valores(vec![Filter::new(
+        "edad",
+        Op::Gt,
+        Some("20".to_string()),
+        false,
+    )]);
+    numeros.sort();
+    assert_eq!(numeros, vec!["100", "30", "42"]);
+}
+
+#[test]
 fn verify_limpio() {
     let (_dir, db) = setup();
     let index = open(&db);

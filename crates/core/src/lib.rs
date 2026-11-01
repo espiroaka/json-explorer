@@ -27,11 +27,11 @@ pub fn init_sqlite() {
 }
 
 pub use index::{
-    Freshness, Index, IndexOptions, Phase, Progress, PropInfo, Stats, Summary, VerifyReport,
-    auto_jobs, build_index, discover_props, open_db, open_db_ro, type_name,
+    FORMAT_VERSION, Freshness, Index, IndexOptions, Phase, Progress, PropInfo, Stats, Summary,
+    VerifyReport, auto_jobs, build_index, discover_props, open_db, open_db_ro, type_name,
 };
 pub use reader::{pretty, read_object};
-pub use search::{Filter, Group, Hit, Op, SearchQuery, count, group_by, search};
+pub use search::{Filter, Group, Hit, Op, SearchQuery, count, group_by, group_matching, search};
 pub use store::{
     Manifest, ShardInfo, StoredIndex, data_root, dir_for_json, find_for_json, indexes_root,
     is_index_dir, list_indices, read_manifest, remove_index,

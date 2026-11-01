@@ -869,6 +869,58 @@ fn top_json_y_count_texto_solo_numero() {
 }
 
 #[test]
+fn top_cuenta_solo_dentro_de_las_coincidencias_pedidas() {
+    let ctx = indexed_ctx();
+    // estado = activo deja a (Toledo) y c (Madrid); sin d, que no tiene estado
+    let text = clean(&run_file(&ctx.db, "top ciudad 2 estado = activo\nq\n"));
+    assert!(text.contains("2 coincidencias"), "{text}");
+    let filas: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("string"))
+        .collect();
+    assert_eq!(filas.len(), 2, "{text}");
+    assert!(filas[0].starts_with("Madrid"), "{filas:?}");
+    assert!(filas[1].starts_with("Toledo"), "{filas:?}");
+
+    // Cuenca solo aparece cuando se cuenta en todo el índice
+    let completo = clean(&run_file(&ctx.db, "top ciudad\nq\n"));
+    assert!(!completo.contains("coincidencias"), "{completo}");
+    assert!(completo.contains("Cuenca"), "{completo}");
+
+    // json y csv siguen siendo legibles por máquina: ni cabeceras ni recuento
+    let acotado = clean(&run_file(
+        &ctx.db,
+        "formato json\ntop estado 1 edad > 20\nq\n",
+    ));
+    assert_eq!(
+        json_documents(&acotado).last().unwrap(),
+        &serde_json::json!([{"value": "activo", "type": "string", "count": 2}])
+    );
+    let csv = clean(&run_file(
+        &ctx.db,
+        "formato csv\ntop nombre 5 ciudad = Madrid\nq\n",
+    ));
+    let datos: Vec<&str> = csv
+        .lines()
+        .skip_while(|line| !line.starts_with("value,"))
+        .skip(1)
+        .collect();
+    assert_eq!(datos.len(), 2, "{csv}");
+    assert!(!csv.contains("coincidencias"), "{csv}");
+
+    // propiedades fuera del índice o consultas ambiguas se siguen rechazando
+    for comando in [
+        "top ciudad 2 inventado = 1",
+        "top ciudad 2 edad >",
+        "top ciudad x",
+    ] {
+        let out = run_file(&ctx.db, &format!("{comando}\nq\n"));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("error"), "{comando} -> {err}");
+    }
+}
+
+#[test]
 fn formatos_persisten_sin_confirmacion_y_csv_tsv_se_leen_desde_stdout() {
     let ctx = indexed_ctx();
     let banner = clean(&run_file(&ctx.db, "q\n"));
@@ -1104,6 +1156,51 @@ fn almacen_por_defecto_menu_reasociacion_rehacer_y_borrar() {
     assert!(text.contains("borrado el índice"), "{text}");
     assert!(!dir.exists());
     assert!(text.contains("no hay índices guardados"), "{text}");
+}
+
+#[test]
+fn indices_marcan_el_formato_antiguo_y_rehacer_lo_renueva() {
+    let ctx = ctx();
+    let state = tempfile::tempdir().unwrap();
+    clean(&run_raw_with_state(
+        &[ctx.json.to_str().unwrap()],
+        "index\nq\n",
+        state.path(),
+    ));
+    let dir = stored_index_dirs(state.path())[0].clone();
+    let manifiesto = dir.join(jxcore::store::MANIFEST);
+    let mut marcado: Value = serde_json::from_slice(&fs::read(&manifiesto).unwrap()).unwrap();
+    marcado["format"] = serde_json::json!(jxcore::FORMAT_VERSION - 1);
+    fs::write(&manifiesto, marcado.to_string()).unwrap();
+
+    let text = clean(&run_raw_with_state(&[], "indices\nq\n", state.path()));
+    assert!(text.contains("· formato antiguo"), "{text}");
+    assert!(text.contains("rehazlos"), "{text}");
+
+    // abrirlo no funciona, pero el shell sigue vivo y explica el motivo
+    let out = run_raw_with_state(&[], "indices abrir 1\nnombre = Antonio\nq\n", state.path());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("usa un formato antiguo"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+
+    // `indices rehacer` escribe el formato actual y el aviso desaparece
+    clean(&run_raw_with_state(
+        &[],
+        "indices rehacer 1\nq\n",
+        state.path(),
+    ));
+    assert_eq!(
+        jxcore::read_manifest(&dir).unwrap().format,
+        jxcore::FORMAT_VERSION
+    );
+    let text = clean(&run_raw_with_state(&[], "indices\nq\n", state.path()));
+    assert!(!text.contains("formato antiguo"), "{text}");
+    let text = clean(&run_raw_with_state(
+        &[],
+        "indices abrir 1\nformato json\nnombre = Antonio\nq\n",
+        state.path(),
+    ));
+    assert_hits(&searches(&text)[0], &[0]);
 }
 
 #[cfg(windows)]

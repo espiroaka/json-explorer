@@ -93,9 +93,16 @@ impl Filter {
     }
 
     pub fn describe(&self) -> String {
+        let symbol = match (self.op, self.fold) {
+            (Op::Eq, true) => "=i",
+            (Op::Ne, true) => "!=i",
+            (Op::Contains, true) => "~i",
+            (Op::Prefix, true) => "^i",
+            (op, _) => op.symbol(),
+        };
         match &self.value {
-            Some(v) => format!("{} {} {v}", self.path, self.op.symbol()),
-            None => format!("{} {}", self.path, self.op.symbol()),
+            Some(v) => format!("{} {symbol} {v}", self.path),
+            None => format!("{} {symbol}", self.path),
         }
     }
 }
@@ -140,7 +147,7 @@ impl SearchQuery {
     }
 }
 
-const COLUMNS: &str = "o.id,o.root_key,p.value,p.type,o.byte_offset,o.byte_length";
+const COLUMNS: &str = "o.id,o.root_key,COALESCE(p.value,p.norm),p.type,o.byte_offset,o.byte_length";
 
 pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     let cache: Arc<Mutex<HashMap<String, Regex>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -262,7 +269,7 @@ fn build_predicate(
     let col = if f.fold && f.op != Op::Regex {
         "p.norm"
     } else {
-        "p.value"
+        "COALESCE(p.value,p.norm)"
     };
     let eq_value = if f.fold && f.op != Op::Regex {
         folded.clone()
@@ -383,7 +390,7 @@ fn fast_plan(f: &Filter, pid: Option<i64>, fts: Option<i64>) -> Result<Option<Pl
             let mut predicate = "p.type IN (0,1,2,3) AND p.norm = ?".to_string();
             let mut args = vec![int(pid), text(folded)];
             if !f.fold {
-                predicate.push_str(" AND p.value = ?");
+                predicate.push_str(" AND COALESCE(p.value,p.norm) = ?");
                 args.push(text(raw_value));
             }
             let mut plan = Plan::fast(
@@ -399,7 +406,7 @@ fn fast_plan(f: &Filter, pid: Option<i64>, fts: Option<i64>) -> Result<Option<Pl
             let (col, value) = if f.fold {
                 ("p.norm", folded)
             } else {
-                ("p.value", raw_value)
+                ("COALESCE(p.value,p.norm)", raw_value)
             };
             let hi = format!("{value}\u{10FFFF}");
             Plan::fast(
@@ -471,7 +478,7 @@ fn display_columns(resolved: &[(&Filter, Option<i64>)]) -> (String, Vec<SqlValue
     if let Some((_, Some(pid))) = display {
         (
             format!(
-                "o.id,o.root_key,COALESCE((SELECT p.value FROM props p WHERE p.object_id = o.id AND p.path_id = ? LIMIT 1), ''),COALESCE((SELECT p.type FROM props p WHERE p.object_id = o.id AND p.path_id = ? LIMIT 1), {T_NULL}),o.byte_offset,o.byte_length"
+                "o.id,o.root_key,COALESCE((SELECT COALESCE(p.value,p.norm) FROM props p WHERE p.object_id = o.id AND p.path_id = ? LIMIT 1), ''),COALESCE((SELECT p.type FROM props p WHERE p.object_id = o.id AND p.path_id = ? LIMIT 1), {T_NULL}),o.byte_offset,o.byte_length"
             ),
             vec![int(*pid), int(*pid)],
         )
@@ -657,16 +664,45 @@ pub struct Group {
 }
 
 pub fn group_by(index: &Index, path: &str, limit: usize) -> Result<Vec<Group>> {
+    group_values(index, path, None, limit)
+}
+
+/// Como `group_by`, pero solo sobre los objetos que casan con `query`.
+pub fn group_matching(
+    index: &Index,
+    path: &str,
+    query: &SearchQuery,
+    limit: usize,
+) -> Result<Vec<Group>> {
+    group_values(index, path, Some(query), limit)
+}
+
+fn group_values(
+    index: &Index,
+    path: &str,
+    query: Option<&SearchQuery>,
+    limit: usize,
+) -> Result<Vec<Group>> {
     let limit = limit.clamp(1, 10_000);
     let mut merged: HashMap<(i64, String), u64> = HashMap::new();
     for conn in index.shards() {
         let Some(pid) = resolve_path(conn, path)? else {
             continue;
         };
-        let mut stmt = conn.prepare(
-            "SELECT type, value, count(*) FROM props WHERE path_id=?1 GROUP BY type, value",
-        )?;
-        let mut rows = stmt.query([pid])?;
+        let mut sql = String::from(
+            "SELECT g.type, COALESCE(g.value,g.norm), count(*) FROM props g WHERE g.path_id = ?",
+        );
+        let mut args = vec![int(pid)];
+        if let Some(query) = query {
+            let plan = plan(conn, query)?;
+            sql.push_str(" AND g.object_id IN (SELECT o.id ");
+            sql.push_str(&plan.from_where);
+            sql.push(')');
+            args.extend(plan.where_args);
+        }
+        sql.push_str(" GROUP BY 1,2");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args.iter()))?;
         while let Some(row) = rows.next()? {
             let kind: i64 = row.get(0)?;
             let value: String = row.get(1)?;

@@ -2,7 +2,8 @@
 
 Explora JSON grandes sin cargar el documento completo en memoria. `jexplorer` es
 **exclusivamente interactivo**: abre una fuente, descubre propiedades, crea un índice
-SQLite `.jindex` y consulta los objetos leyendo sus posiciones en el JSON original.
+SQLite repartido en varios fragmentos dentro de una carpeta y consulta los objetos
+leyendo sus posiciones en el JSON original.
 En una terminal muestra menús navegables con flechas; con entrada o salida
 redirigida conserva el shell textual para scripts.
 El JSON no se modifica ni se copia al indexarlo.
@@ -16,6 +17,9 @@ Ejecuta `jexplorer` o `jexplorer "C:\datos\datos.json"` en CMD:
 - **← / Esc**: vuelve atrás; desde el visor conserva la página y el resultado.
 - **RePág / AvPág**: cambia de página de resultados o desplaza el visor.
 - **Inicio / Fin**: extremos de la página actual; en el visor, inicio/final del objeto.
+- En la pantalla de coincidencias, **+/a** añade una condición, **-/z** quita la
+  última y **t** lista los valores más frecuentes de una propiedad entre ellas
+  (Enter sobre un valor lo convierte en condición).
 - En el visor, **r** alterna original/formateado y **e** exporta los bytes originales.
 - En los campos de texto, ← / → editan; Enter acepta y Esc cancela.
 - En el menú principal, Esc o `q` salen.
@@ -23,14 +27,15 @@ Ejecuta `jexplorer` o `jexplorer "C:\datos\datos.json"` en CMD:
 Puedes buscar eligiendo propiedad, operador y valor, o escribir una consulta
 completa. El navegador muestra el total de coincidencias y carga **solo una página**
 de objetos cada vez; las flechas cruzan los límites de página automáticamente.
+El subtítulo recuerda las condiciones activas de la búsqueda.
 El visor no tiene el límite de 200 líneas del shell textual y ajusta las líneas
 al ancho de la terminal.
 
-Los menús incluyen apertura, indexación, propiedades, estadísticas, valores
-frecuentes, verificación y ajustes. **Comandos del shell** conserva las operaciones
-avanzadas; indexar y verificar muestran su salida textual y esperan Enter para
-volver al menú. Rehacer un índice requiere confirmación. **Última búsqueda** vuelve
-a cargar los resultados desde la primera página.
+Los menús incluyen apertura, indexación, índices guardados, propiedades,
+estadísticas, valores frecuentes, verificación y ajustes. **Comandos del shell**
+conserva las operaciones avanzadas; indexar y verificar muestran su salida textual y
+esperan Enter para volver al menú. Rehacer un índice requiere confirmación.
+**Última búsqueda** vuelve a cargar los resultados desde la primera página.
 
 Abrir un JSON sigue sin indexarlo automáticamente. Usa **Indexar JSON** si no
 hay un índice válido. Los formatos `json`, `csv` y `tsv` afectan a los comandos
@@ -61,12 +66,12 @@ El documento debe tener un objeto raíz cuyas claves identifiquen los objetos:
 }
 ```
 
-En CMD, inicia el shell vacío o abre directamente un JSON o un índice:
+En CMD, inicia el shell vacío o abre directamente un JSON o la carpeta de un índice:
 
 ```bat
 jexplorer
 jexplorer "C:\datos con espacios\datos.json"
-jexplorer "C:\datos con espacios\datos.json.jindex"
+jexplorer "%LOCALAPPDATA%\json-explorer\indexes\datos-a1b2c3d4e5f60718"
 jexplorer --help
 jexplorer --version
 ```
@@ -96,27 +101,31 @@ jx> verify
 jx> q
 ```
 
-Abrir un JSON **no lo indexa automáticamente**. Si existe su sidecar
-`datos.json.jindex`, sano y completo, se abre ese índice; en caso contrario queda
-seleccionado el JSON y se indica usar `index`. `props` permite descubrir sus
-propiedades antes de indexar. Abrir un `.jindex` inválido muestra un error y
-conserva la sesión anterior. Una apertura válida borra los resultados y la última
-consulta de la fuente anterior.
+Abrir un JSON **no lo indexa automáticamente**. Para encontrar su índice se miran,
+en este orden, el almacén de índices (ver **Dónde vive el índice**) y la carpeta local
+`FICHERO.json.jindex` junto al JSON. Si ninguno abre de forma válida, el JSON queda
+seleccionado y se indica usar `index`; `props` permite descubrir sus propiedades antes
+de indexarlo. Un índice de un formato antiguo, uno incompleto o un `.jindex` suelto
+del formato de un solo fichero muestran un error explicativo y conservan la sesión
+anterior. Una apertura válida borra los resultados y la última consulta de la fuente
+anterior.
 
 ## Comandos del shell
 
 | Comando | Función |
 | --- | --- |
-| `abrir "FICHERO"` / `open "FICHERO"` | Selecciona un JSON o `.jindex`; las rutas de Windows conservan sus barras inversas. |
+| `abrir "FICHERO"` / `open "FICHERO"` | Selecciona un JSON o la carpeta de un índice; las rutas de Windows conservan sus barras inversas. |
 | `props` | Sin índice, descubre propiedades en los primeros 1000 objetos; con índice, muestra rutas indexadas. |
 | `props N` | Descubre propiedades usando una muestra de N objetos del JSON. |
 | `index [OPCIONES]` | Indexa la fuente y la deja lista para buscar; por defecto, todas las propiedades. |
+| `indices` | Lista los índices guardados: objetos, tamaño, fragmentos y avisos (`FTS`, `incompleto`, `formato antiguo`). |
+| `indices abrir\|borrar\|rehacer N` | Abre, elimina o rehace el índice número N de esa lista (más reciente primero; `N` empieza en 1). |
 | `PROP OP VALOR` / `buscar CONSULTA` | Busca; admite varios filtros con el mismo conector `&` o `\|`. |
 | `count [CONSULTA]` | Cuenta una consulta nueva o la última búsqueda sin cambiar sus hits ni su página. |
 | `n` | Siguiente página de la búsqueda activa. |
 | `limite N` | Tamaño de página entre 1 y 10000; borra hits y última búsqueda. |
 | `formato table\|json\|csv\|tsv` | Formato persistente en la sesión, sin mensaje de confirmación. |
-| `top PROP [N]` | Valores más frecuentes, en el formato seleccionado. |
+| `top PROP [N] [CONSULTA]` | Valores más frecuentes, en el formato seleccionado; con consulta, solo dentro de sus coincidencias. |
 | `ver N` / `raw N` | Resultado N de la página actual, formateado o tal cual. Las posiciones empiezan en 1. |
 | `id N` / `key CLAVE` | Lee por id interno (empieza en 0) o clave raíz. |
 | `e N "FICHERO"` | Exporta los bytes exactos del resultado N, sin reformatearlos. |
@@ -128,6 +137,32 @@ consulta de la fuente anterior.
 Los errores de comandos se escriben en **stderr** y el shell continúa. EOF o `q`
 terminan con código 0 aunque hubiera errores internos; un error al abrir el
 fichero inicial termina con código 1.
+
+### Dónde vive el índice
+
+Un índice es una **carpeta** con `manifest.json` y sus fragmentos `shard-XXX.jxdb`:
+los objetos se reparten entre los fragmentos por id y las búsquedas los recorren todos.
+El número de fragmentos lo fija `--jobs`; sin esa opción se eligen según los núcleos
+disponibles (entre 2 y 8).
+
+Por defecto `index` escribe en el almacén, bajo `indexes\<nombre>-<hash>`:
+
+```text
+%LOCALAPPDATA%\json-explorer              (Windows; si falta, %APPDATA%)
+$XDG_DATA_HOME/json-explorer              (Linux/macOS; si falta, ~/.local/share/json-explorer)
+```
+
+El nombre combina el nombre del JSON con un hash de su ruta canónica, y
+`JXPLORER_DATA_DIR` cambia la raíz del almacén. `indices` lista esas carpetas desde la
+más reciente y `indices abrir|borrar|rehacer N` actúa sobre ellas; el menú
+**Índices guardados** hace lo mismo con flechas. Borrar un índice no toca el JSON:
+solo obliga a indexar de nuevo.
+
+`index --db CARPETA` guarda el índice donde tú quieras, y si abres esa carpeta y
+vuelves a ejecutar `index` reutiliza su ruta. Un índice fuera del almacén **no se
+encuentra solo** al abrir el JSON: hay que abrirlo pasándole su carpeta a `abrir` (o
+como argumento inicial de `jexplorer`). La única carpeta junto al JSON que sí se busca
+automáticamente —después del almacén— es `FICHERO.json.jindex`.
 
 ### Indexación
 
@@ -144,11 +179,14 @@ index --force --all --fts
 - `--select PROP` es repetible y limita las propiedades; `--all` las incluye todas.
 - `--fts` añade FTS5 con tokenizador trigram para búsquedas de texto.
 - `--batch N` establece los objetos por transacción; debe ser positivo.
-- `--db FICHERO` elige la ruta del índice; por defecto se usa el sidecar
-  `FICHERO.json.jindex` junto al JSON. Si rehaces un índice abierto, conserva su ruta.
+- `--jobs N` fija cuántos fragmentos se escriben (1 a 64); se indexan en paralelo.
+- `--db CARPETA` elige dónde se guarda el índice; la crea si falta y, sin esa opción,
+  se usa el almacén (ver **Dónde vive el índice**). Rehacer un índice abierto conserva
+  su ruta.
 - **Precaución con `--force`: rehace el índice desde cero.** Revisa su ruta y las
   propiedades/FTS deseadas antes de usarlo. No modifica el JSON, pero sustituye
-  el índice anterior; puede ser necesario al cambiar de versión del formato.
+  el índice anterior; es necesario cuando el índice es de un formato antiguo, y
+  `indices rehacer <n>` hace exactamente eso sin escribir el comando.
 
 ### Operadores y consultas
 

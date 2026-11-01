@@ -469,14 +469,204 @@ fn viewer(session: &super::Session, hit: &jxcore::Hit) -> Result<()> {
     }
 }
 
+const OPERATORS: &[&str] = &[
+    "= igual",
+    "!= distinto",
+    "~ contiene",
+    "^ empieza por",
+    "=i igual sin mayúsculas/acentos",
+    "~i contiene sin mayúsculas/acentos",
+    "> mayor",
+    ">= mayor o igual",
+    "< menor",
+    "<= menor o igual",
+    "? existe",
+    "!? no existe",
+    "null es null",
+    "~r expresión regular",
+];
+
+fn condition_summary(filters: &[jxcore::Filter], any: bool) -> String {
+    let joiner = if any { " | " } else { " & " };
+    clip(
+        &filters
+            .iter()
+            .map(jxcore::Filter::describe)
+            .collect::<Vec<_>>()
+            .join(joiner),
+        48,
+    )
+}
+
+fn ask_filter(props: &[String]) -> Result<Option<jxcore::Filter>> {
+    if props.is_empty() {
+        document("Sin propiedades", "este índice no guarda ninguna propiedad")?;
+        return Ok(None);
+    }
+    let Some(property) = menu("Propiedad", "Elige una propiedad indexada", props, &mut 0)? else {
+        return Ok(None);
+    };
+    let Some(operator) = choose("Operador", &props[property], OPERATORS)? else {
+        return Ok(None);
+    };
+    let (op, fold) = super::parse_op_fold(
+        OPERATORS[operator]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default(),
+    )?;
+    let value = if op.needs_value() {
+        prompt("Valor a buscar", &props[property])?
+    } else {
+        None
+    };
+    Ok(Some(jxcore::Filter::new(&props[property], op, value, fold)))
+}
+
+fn reload(
+    session: &mut super::Session,
+    filters: &[jxcore::Filter],
+    any: bool,
+    page_size: usize,
+) -> Result<Results> {
+    let results = Results::new(&session.index, filters.to_vec(), any, page_size)?;
+    session.last = Some((filters.to_vec(), any));
+    Ok(results)
+}
+
+/// Valores más frecuentes de una propiedad dentro de las coincidencias actuales.
+/// Devuelve el filtro que añade la selección, si el usuario elige uno.
+fn facet(
+    index: &jxcore::Index,
+    props: &[String],
+    filters: &[jxcore::Filter],
+    any: bool,
+    total: u64,
+) -> Result<Option<jxcore::Filter>> {
+    let Some(property) = menu(
+        "Valores frecuentes",
+        "Elige una propiedad de las coincidencias",
+        props,
+        &mut 0,
+    )?
+    else {
+        return Ok(None);
+    };
+    let path = props[property].clone();
+    let groups = jxcore::group_matching(
+        index,
+        &path,
+        &jxcore::SearchQuery {
+            filters: filters.to_vec(),
+            any,
+            limit: PAGE,
+            after: None,
+        },
+        100,
+    )?;
+    if groups.is_empty() {
+        document(
+            "Valores frecuentes",
+            &format!("ninguna coincidencia tiene `{path}`"),
+        )?;
+        return Ok(None);
+    }
+    let labels: Vec<String> = groups
+        .iter()
+        .map(|group| format!("{}    {}", clip(&group.value, 52), fmt(group.count)))
+        .collect();
+    let Some(pick) = menu(
+        &format!("Valores de {path}"),
+        &format!(
+            "{} coincidencias; las que no tienen `{path}` no cuentan · Enter añade la condición",
+            fmt(total)
+        ),
+        &labels,
+        &mut 0,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(jxcore::Filter::new(
+        path,
+        jxcore::Op::Eq,
+        Some(groups[pick].value.clone()),
+        false,
+    )))
+}
+
+/// Mensaje de las acciones que no pueden añadir una condición a una búsqueda con `|`.
+const ANY_CONFLICT: &str =
+    "esta búsqueda une condiciones con | ; vuelve a hacerla con & para poder añadirlas";
+
+/// Copia `filters` y añade `filter` al final.
+fn with_extra(filters: &[jxcore::Filter], filter: jxcore::Filter) -> Vec<jxcore::Filter> {
+    let mut extended = filters.to_vec();
+    extended.push(filter);
+    extended
+}
+
+/// Lo que la tecla pulsada en la pantalla de coincidencias pide hacer.
+/// Las variantes `*Blocked` son rechazos: la acción no tiene sentido con las
+/// condiciones actuales y solo se muestra el motivo.
+#[derive(Debug, PartialEq, Eq)]
+enum BrowseAction {
+    Back,
+    Down,
+    Up,
+    NextPage,
+    PreviousPage,
+    FirstRow,
+    LastRow,
+    View,
+    AddCondition,
+    AddBlocked,
+    UndoCondition,
+    UndoBlocked,
+    Facet,
+    Ignore,
+}
+
+fn browse_action(event: &KeyEvent, any: bool, filters_len: usize) -> BrowseAction {
+    if back(*event) {
+        return BrowseAction::Back;
+    }
+    match event.code {
+        KeyCode::Char('+') | KeyCode::Char('a') => {
+            if any {
+                BrowseAction::AddBlocked
+            } else {
+                BrowseAction::AddCondition
+            }
+        }
+        KeyCode::Char('-') | KeyCode::Char('z') => {
+            if filters_len < 2 {
+                BrowseAction::UndoBlocked
+            } else {
+                BrowseAction::UndoCondition
+            }
+        }
+        KeyCode::Char('t') => BrowseAction::Facet,
+        KeyCode::Down => BrowseAction::Down,
+        KeyCode::Up => BrowseAction::Up,
+        KeyCode::PageDown => BrowseAction::NextPage,
+        KeyCode::PageUp => BrowseAction::PreviousPage,
+        KeyCode::Home => BrowseAction::FirstRow,
+        KeyCode::End => BrowseAction::LastRow,
+        KeyCode::Enter | KeyCode::Right => BrowseAction::View,
+        _ => BrowseAction::Ignore,
+    }
+}
+
 fn browse(shell: &mut Shell, filters: Vec<jxcore::Filter>, any: bool) -> Result<()> {
     let page_size = shell.output.limit;
     let session = shell.session()?;
     for filter in &filters {
         session.require_path(&filter.path)?;
     }
-    let mut results = Results::new(&session.index, filters.clone(), any, page_size)?;
-    session.last = Some((filters, any));
+    let props = session.props.clone();
+    let mut filters = filters;
+    let mut results = reload(session, &filters, any, page_size)?;
     loop {
         let height = body_height()?;
         let start = results.selected.saturating_sub(height - 1);
@@ -505,40 +695,79 @@ fn browse(shell: &mut Shell, filters: Vec<jxcore::Filter>, any: bool) -> Result<
         draw(
             "Coincidencias",
             &format!(
-                "Resultado {} / {} · Página {} · {} filas por página",
+                "{} · Resultado {} / {} · Página {} · {} filas por página",
+                condition_summary(&filters, any),
                 fmt(results.current_number()),
                 fmt(results.total),
                 results.page + 1,
                 page_size
             ),
             &rows,
-            "↑/↓ recorrer todas · Enter/→ ver objeto · ←/Esc menú · RePág/AvPág cambiar página",
+            "↑/↓ recorrer todas · Enter/→ ver objeto · +/a añadir · -/z quitar última · t valores frecuentes · ←/Esc menú · RePág/AvPág cambiar página",
         )?;
         let event = key()?;
-        if back(event) {
-            break;
-        }
-        let action = match event.code {
-            KeyCode::Down => results.down(&session.index),
-            KeyCode::Up => results.up(&session.index),
-            KeyCode::PageDown => results.next_page(&session.index).map(|_| ()),
-            KeyCode::PageUp => results.previous_page(&session.index).map(|_| ()),
-            KeyCode::Home => {
-                results.selected = 0;
-                Ok(())
+        let next = match browse_action(&event, any, filters.len()) {
+            BrowseAction::Back => break,
+            BrowseAction::AddBlocked => {
+                document("No se puede acotar", ANY_CONFLICT)?;
+                None
             }
-            KeyCode::End => {
-                results.selected = results.hits.len().saturating_sub(1);
-                Ok(())
+            BrowseAction::UndoBlocked => {
+                document("Nada que quitar", "solo queda una condición en la búsqueda")?;
+                None
             }
-            KeyCode::Enter | KeyCode::Right => match results.hits.get(results.selected) {
-                Some(hit) => viewer(session, hit),
-                None => Ok(()),
-            },
-            _ => Ok(()),
+            BrowseAction::AddCondition => {
+                ask_filter(&props)?.map(|filter| with_extra(&filters, filter))
+            }
+            BrowseAction::UndoCondition => {
+                let mut shortened = filters.clone();
+                shortened.pop();
+                Some(shortened)
+            }
+            BrowseAction::Facet => {
+                match facet(&session.index, &props, &filters, any, results.total)? {
+                    Some(filter) if !any => Some(with_extra(&filters, filter)),
+                    Some(_) => {
+                        document("No se puede acotar", ANY_CONFLICT)?;
+                        None
+                    }
+                    None => None,
+                }
+            }
+            other => {
+                let moved = match other {
+                    BrowseAction::Down => results.down(&session.index),
+                    BrowseAction::Up => results.up(&session.index),
+                    BrowseAction::NextPage => results.next_page(&session.index).map(|_| ()),
+                    BrowseAction::PreviousPage => results.previous_page(&session.index).map(|_| ()),
+                    BrowseAction::FirstRow => {
+                        results.selected = 0;
+                        Ok(())
+                    }
+                    BrowseAction::LastRow => {
+                        results.selected = results.hits.len().saturating_sub(1);
+                        Ok(())
+                    }
+                    BrowseAction::View => match results.hits.get(results.selected) {
+                        Some(hit) => viewer(session, hit),
+                        None => Ok(()),
+                    },
+                    _ => Ok(()),
+                };
+                if let Err(error) = moved {
+                    document("Error", &format!("{error:#}"))?;
+                }
+                None
+            }
         };
-        if let Err(error) = action {
-            document("Error", &format!("{error:#}"))?;
+        if let Some(next) = next {
+            match reload(session, &next, any, page_size) {
+                Ok(refreshed) => {
+                    results = refreshed;
+                    filters = next;
+                }
+                Err(error) => document("Error", &format!("{error:#}"))?,
+            }
         }
     }
     session.hits = results.hits;
@@ -557,61 +786,20 @@ fn search(shell: &mut Shell, guided: bool) -> Result<()> {
         return Ok(());
     }
     let props = shell.session()?.props.clone();
-    let Some(property) = menu(
-        "Buscar por propiedad",
-        "Elige una propiedad indexada",
-        &props,
-        &mut 0,
-    )?
-    else {
-        return Ok(());
-    };
-    let operators = [
-        "= igual",
-        "!= distinto",
-        "~ contiene",
-        "^ empieza por",
-        "=i igual sin mayúsculas/acentos",
-        "~i contiene sin mayúsculas/acentos",
-        "> mayor",
-        ">= mayor o igual",
-        "< menor",
-        "<= menor o igual",
-        "? existe",
-        "!? no existe",
-        "null es null",
-        "~r expresión regular",
-    ];
-    let Some(operator) = choose("Operador", &props[property], &operators)? else {
-        return Ok(());
-    };
-    let (op, fold) = super::parse_op_fold(operators[operator].split_whitespace().next().unwrap())?;
-    let value = if matches!(
-        op,
-        jxcore::Op::Exists | jxcore::Op::Missing | jxcore::Op::Null
-    ) {
-        None
-    } else {
-        let Some(value) = prompt("Valor a buscar", &props[property])? else {
-            return Ok(());
-        };
-        Some(value)
-    };
-    browse(
-        shell,
-        vec![jxcore::Filter::new(&props[property], op, value, fold)],
-        false,
-    )
+    if let Some(filter) = ask_filter(&props)? {
+        browse(shell, vec![filter], false)?;
+    }
+    Ok(())
 }
 
 fn index(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
     shell.json.as_ref().context("abre un JSON primero")?;
     let Some(choice) = choose(
         "Indexar JSON",
-        "El JSON original no se modifica. FTS acelera texto y aumenta el tamaño del índice.",
+        "El JSON original no se modifica. La FTS solo compensa en texto largo: tarda más y ocupa más.",
         &[
-            "Todas las propiedades",
-            "Todas las propiedades + FTS",
+            "Todas las propiedades (recomendado)",
+            "Todas las propiedades + FTS (texto largo)",
             "Opciones avanzadas",
             "Rehacer índice (sustituye el anterior)",
         ],
@@ -974,11 +1162,16 @@ fn stored_indices(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
             .map(|entry| {
                 let manifest = &entry.manifest;
                 format!(
-                    "{}{} · {} objetos · {} · {} fragmentos{}",
+                    "{}{}{} · {} objetos · {} · {} fragmentos{}",
                     if manifest.status == "complete" {
                         ""
                     } else {
                         "[incompleto] "
+                    },
+                    if super::outdated(manifest) {
+                        "[obsoleto] "
+                    } else {
+                        ""
                     },
                     display_path(Path::new(&manifest.source)),
                     fmt(manifest.objects),
@@ -992,8 +1185,13 @@ fn stored_indices(shell: &mut Shell, terminal: &mut Terminal) -> Result<()> {
         let Some(position) = menu(
             "Índices guardados",
             &format!(
-                "{} · Enter/→ elegir · Esc volver",
-                display_path(&jxcore::indexes_root())
+                "{} · Enter/→ elegir · Esc volver{}",
+                display_path(&jxcore::indexes_root()),
+                if entries.iter().any(|entry| super::outdated(&entry.manifest)) {
+                    " · los [obsoleto] solo se pueden rehacer"
+                } else {
+                    ""
+                }
             ),
             &items,
             &mut selected,
@@ -1365,6 +1563,140 @@ mod tests {
         assert_eq!(clean("a\x1b[31m\n\t\u{202e}b"), "a [31m   b");
         assert_eq!(clip("a界bc", 3), "a界");
         assert_eq!(clip("éx", 1), "é");
+    }
+
+    #[test]
+    fn resume_condiciones_sin_pasarse_del_ancho() {
+        let filters = vec![
+            jxcore::Filter::new("edad", jxcore::Op::Gt, Some("30".to_string()), false),
+            jxcore::Filter::new("ciudad", jxcore::Op::Eq, Some("Madrid".to_string()), true),
+        ];
+        assert_eq!(
+            condition_summary(&filters, false),
+            "edad > 30 & ciudad =i Madrid"
+        );
+        assert_eq!(
+            condition_summary(&filters, true),
+            "edad > 30 | ciudad =i Madrid"
+        );
+        let repetidas: Vec<jxcore::Filter> = (0..20).map(|_| filters[0].clone()).collect();
+        assert_eq!(condition_summary(&repetidas, false).chars().count(), 48);
+    }
+
+    fn pressed(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn teclas_de_coincidencias_se_traducen_en_acciones() {
+        for code in [KeyCode::Char('+'), KeyCode::Char('a')] {
+            assert_eq!(
+                browse_action(&pressed(code), false, 1),
+                BrowseAction::AddCondition
+            );
+        }
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Char('-')), false, 2),
+            BrowseAction::UndoCondition
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Char('t')), false, 1),
+            BrowseAction::Facet
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Down), false, 1),
+            BrowseAction::Down
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Up), false, 1),
+            BrowseAction::Up
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::PageDown), false, 1),
+            BrowseAction::NextPage
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::PageUp), false, 1),
+            BrowseAction::PreviousPage
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Home), false, 1),
+            BrowseAction::FirstRow
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::End), false, 1),
+            BrowseAction::LastRow
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Enter), false, 1),
+            BrowseAction::View
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Right), false, 1),
+            BrowseAction::View
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Null), false, 1),
+            BrowseAction::Ignore
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Char('x')), false, 1),
+            BrowseAction::Ignore
+        );
+    }
+
+    #[test]
+    fn acciones_que_no_tienen_sentido_se_rechazan_sin_mover_nada() {
+        // una OR no se puede acotar; ver los valores de todas formas es útil
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Char('+')), true, 1),
+            BrowseAction::AddBlocked
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Char('a')), true, 3),
+            BrowseAction::AddBlocked
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Char('t')), true, 3),
+            BrowseAction::Facet
+        );
+        // con una sola condición no hay nada que quitar
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Char('-')), false, 1),
+            BrowseAction::UndoBlocked
+        );
+        assert_eq!(
+            browse_action(&pressed(KeyCode::Char('z')), false, 0),
+            BrowseAction::UndoBlocked
+        );
+    }
+
+    #[test]
+    fn cualquier_ruta_de_salida_vuelve_al_menu() {
+        for code in [KeyCode::Esc, KeyCode::Left, KeyCode::Char('q')] {
+            assert_eq!(browse_action(&pressed(code), true, 2), BrowseAction::Back);
+        }
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(browse_action(&ctrl_c, false, 1), BrowseAction::Back);
+    }
+
+    #[test]
+    fn anadir_una_condicion_no_toca_la_anterior() {
+        let base = vec![jxcore::Filter::new(
+            "edad",
+            jxcore::Op::Gt,
+            Some("30".to_string()),
+            false,
+        )];
+        let nueva =
+            jxcore::Filter::new("ciudad", jxcore::Op::Eq, Some("Madrid".to_string()), false);
+        let extended = with_extra(&base, nueva);
+        assert_eq!(base.len(), 1);
+        assert_eq!(extended.len(), 2);
+        assert_eq!(
+            condition_summary(&extended, false),
+            "edad > 30 & ciudad = Madrid"
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::parser::{CHUNK, MemberIdx, RootScanner, object_members};
 use crate::store::{self, Manifest, ShardInfo};
 use crate::text::fold;
 
-pub const FORMAT_VERSION: i64 = 6;
+pub const FORMAT_VERSION: i64 = 7;
 pub const MAX_STORED_NESTED: usize = 4096;
 
 pub const T_STRING: i64 = 0;
@@ -202,7 +202,7 @@ fn init_tables(conn: &Connection) -> Result<()> {
              object_id INTEGER NOT NULL,
              path_id INTEGER NOT NULL,
              type INTEGER NOT NULL,
-             value TEXT NOT NULL,
+             value TEXT,
              num REAL,
              norm TEXT NOT NULL,
              PRIMARY KEY(object_id, path_id)
@@ -484,10 +484,16 @@ impl ShardState {
                     let (ty, value) = encode_value(raw);
                     let num = numeric_value(raw, ty);
                     let norm = fold(&value);
+                    // `value` solo aporta algo frente a `norm` cuando difiere; si
+                    // coincide se omite y las lecturas usan COALESCE(value, norm).
                     self.prop_values.push(SqlValue::Integer(o.id));
                     self.prop_values.push(SqlValue::Integer(pid));
                     self.prop_values.push(SqlValue::Integer(ty));
-                    self.prop_values.push(SqlValue::Text(value));
+                    self.prop_values.push(if value == norm {
+                        SqlValue::Null
+                    } else {
+                        SqlValue::Text(value)
+                    });
                     self.prop_values
                         .push(num.map(SqlValue::Real).unwrap_or(SqlValue::Null));
                     self.prop_values.push(SqlValue::Text(norm));
@@ -1304,7 +1310,7 @@ impl Index {
                 conn.prepare("SELECT root_key, byte_offset, byte_length FROM objects WHERE id=?1")?,
             );
             prop_stmts.push(conn.prepare(
-                "SELECT pa.path, p.type, p.value
+                "SELECT pa.path, p.type, COALESCE(p.value, p.norm)
                    FROM props p JOIN paths pa ON pa.id=p.path_id
                   WHERE p.object_id=?1
                   ORDER BY pa.path",

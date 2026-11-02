@@ -1,13 +1,15 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
-use crate::index::{Index, T_NULL, T_STRING, type_name};
+use crate::index::{Index, T_NULL, T_STRING, open_db_ro_with, type_name};
 use crate::text::fold;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +124,7 @@ impl Hit {
     }
 }
 
+#[derive(Clone)]
 pub struct SearchQuery {
     pub filters: Vec<Filter>,
     pub any: bool,
@@ -222,6 +225,7 @@ fn int(v: i64) -> SqlValue {
 struct Plan {
     columns: String,
     from_where: String,
+    count_from_where: String,
     order_col: &'static str,
     select_args: Vec<SqlValue>,
     where_args: Vec<SqlValue>,
@@ -243,6 +247,7 @@ impl Plan {
     fn fast_cols(columns: String, from_where: String, args: Vec<SqlValue>) -> Self {
         Self {
             columns,
+            count_from_where: from_where.clone(),
             from_where,
             order_col: "o.id",
             select_args: args.clone(),
@@ -399,11 +404,16 @@ fn fast_plan(f: &Filter, pid: Option<i64>, fts: Option<i64>) -> Result<Option<Pl
                 predicate.push_str(" AND COALESCE(p.value,p.norm) = ?");
                 args.push(text(raw_value));
             }
+            // Contar no necesita resolver el objeto: cada fila de props se
+            // escribió en la misma transacción que su objeto.
             let mut plan = Plan::fast(
                 format!(
                     "FROM props p INDEXED BY idx_props_search JOIN objects o ON o.id = p.object_id WHERE p.path_id = ? AND {predicate}"
                 ),
                 args,
+            );
+            plan.count_from_where = format!(
+                "FROM props p INDEXED BY idx_props_search WHERE p.path_id = ? AND {predicate}"
             );
             plan.order_col = "p.object_id";
             plan
@@ -459,17 +469,25 @@ fn fast_plan(f: &Filter, pid: Option<i64>, fts: Option<i64>) -> Result<Option<Pl
             vec![int(pid)],
         ),
         Op::Contains if f.fold && folded.chars().count() >= 3 => match fts {
-            Some(base) => Plan::fast(
-                format!(
-                    "FROM fts JOIN props p ON p.object_id = fts.rowid / {base} AND p.path_id = fts.rowid % {base} JOIN objects o ON o.id = p.object_id WHERE fts MATCH ? AND fts.rowid % {base} = ? AND p.type = ? AND instr(p.norm, ?) > 0"
-                ),
-                vec![
-                    text(fts_query(&folded)),
-                    int(pid),
-                    int(T_STRING),
-                    text(folded),
-                ],
-            ),
+            Some(base) => {
+                let from = format!(
+                    "FROM fts JOIN props p ON p.object_id = fts.rowid / {base} AND p.path_id = fts.rowid % {base}"
+                );
+                let filter = format!(
+                    "WHERE fts MATCH ? AND fts.rowid % {base} = ? AND p.type = ? AND instr(p.norm, ?) > 0"
+                );
+                let mut plan = Plan::fast(
+                    format!("{from} JOIN objects o ON o.id = p.object_id {filter}"),
+                    vec![
+                        text(fts_query(&folded)),
+                        int(pid),
+                        int(T_STRING),
+                        text(folded),
+                    ],
+                );
+                plan.count_from_where = format!("{from} {filter}");
+                plan
+            }
             None => return Ok(None),
         },
         _ => return Ok(None),
@@ -548,6 +566,9 @@ fn and_fast_plan(resolved: &[(&Filter, Option<i64>)], fts: Option<i64>) -> Resul
         plan.from_where.push(')');
         plan.where_args.extend(args);
     }
+    // Las condiciones añadidas se refieren a `o.id`, así que el recuento vuelve
+    // a la consulta completa.
+    plan.count_from_where.clone_from(&plan.from_where);
     let (columns, mut select_args) = display_columns(resolved);
     select_args.extend(plan.where_args.iter().cloned());
     plan.columns = columns;
@@ -600,9 +621,11 @@ fn plan(conn: &Connection, q: &SearchQuery) -> Result<Plan> {
     let mut select_args = display_args;
     select_args.extend(where_args.iter().cloned());
     let joiner = if q.any { " OR " } else { " AND " };
+    let from_where = format!("FROM objects o WHERE ({})", preds.join(joiner));
     Ok(Plan {
         columns,
-        from_where: format!("FROM objects o WHERE ({})", preds.join(joiner)),
+        count_from_where: from_where.clone(),
+        from_where,
         order_col: "o.id",
         select_args,
         where_args,
@@ -638,9 +661,73 @@ fn search_conn(conn: &Connection, q: &SearchQuery, limit: i64) -> Result<Vec<Hit
 
 fn count_conn(conn: &Connection, q: &SearchQuery) -> Result<u64> {
     let plan = plan(conn, q)?;
-    let sql = format!("SELECT count(*) {}", plan.from_where);
+    let sql = format!("SELECT count(*) {}", plan.count_from_where);
     let n: i64 = conn.query_row(&sql, params_from_iter(plan.where_args.iter()), |r| r.get(0))?;
     Ok(n.max(0) as u64)
+}
+
+const COUNT_CACHE_KB: i64 = 8_192;
+
+pub struct CountJob {
+    rx: mpsc::Receiver<Result<u64>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl CountJob {
+    /// `Some` cuando termina, `None` mientras sigue contando.
+    pub fn poll(&mut self) -> Option<Result<u64>> {
+        match self.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(anyhow!(
+                "el recuento en segundo plano terminó de forma inesperada"
+            ))),
+        }
+    }
+}
+
+impl Drop for CountJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Index {
+    /// Cuenta en un hilo propio y con conexiones de lectura nuevas para que la
+    /// primera página no espere al total. Al soltar el trabajo se cancela entre
+    /// fragmentos, de modo que acotar la búsqueda no deja recuentos antiguos
+    /// ocupando núcleos.
+    pub fn start_count(&self, query: &SearchQuery) -> Result<CountJob> {
+        let dir = self.dir.clone();
+        let files: Vec<String> = self
+            .manifest
+            .shards
+            .iter()
+            .map(|shard| shard.file.clone())
+            .collect();
+        let query = query.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("jx-count".to_string())
+            .spawn(move || {
+                let total = (|| -> Result<u64> {
+                    let mut total = 0u64;
+                    for file in files {
+                        if stop.load(Ordering::Relaxed) {
+                            bail!("recuento cancelado");
+                        }
+                        let conn = open_db_ro_with(&dir.join(&file), COUNT_CACHE_KB)?;
+                        total += count_conn(&conn, &query)?;
+                    }
+                    Ok(total)
+                })();
+                let _ = tx.send(total);
+            })
+            .context("no puedo iniciar el recuento en segundo plano")?;
+        Ok(CountJob { rx, cancel })
+    }
 }
 
 pub fn search(index: &Index, q: &SearchQuery) -> Result<Vec<Hit>> {

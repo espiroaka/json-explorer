@@ -170,7 +170,7 @@ pub fn open_db_ro(path: &Path) -> Result<Connection> {
     open_db_ro_with(path, 131_072)
 }
 
-fn open_db_ro_with(path: &Path, cache_kb: i64) -> Result<Connection> {
+pub(crate) fn open_db_ro_with(path: &Path, cache_kb: i64) -> Result<Connection> {
     let opened = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY);
     match opened {
         Ok(conn) => {

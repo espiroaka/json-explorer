@@ -1,5 +1,7 @@
 use anyhow::{Result, ensure};
-use jxcore::{Filter, Hit, Index, SearchQuery, count, search};
+#[cfg(test)]
+use jxcore::count;
+use jxcore::{CountJob, Filter, Hit, Index, SearchQuery, search};
 
 pub(super) struct Results {
     pub hits: Vec<Hit>,
@@ -10,9 +12,12 @@ pub(super) struct Results {
     any: bool,
     page_size: usize,
     cursors: Vec<Option<i64>>,
+    count: Option<CountJob>,
+    count_failed: bool,
 }
 
 impl Results {
+    #[cfg(test)]
     pub fn new(index: &Index, filters: Vec<Filter>, any: bool, page_size: usize) -> Result<Self> {
         ensure!(
             (1..=10_000).contains(&page_size),
@@ -36,7 +41,66 @@ impl Results {
             page_size,
             // None permite incluir el ID 0 al regresar a la primera página.
             cursors: vec![None],
+            count: None,
+            count_failed: false,
         })
+    }
+
+    /// Carga la primera página y deja el total contándose en segundo plano.
+    pub fn start(index: &Index, filters: Vec<Filter>, any: bool, page_size: usize) -> Result<Self> {
+        ensure!(
+            (1..=10_000).contains(&page_size),
+            "el tamaño de página debe estar entre 1 y 10000"
+        );
+        let query = SearchQuery {
+            filters,
+            any,
+            limit: page_size,
+            after: None,
+        };
+        let count = index.start_count(&query)?;
+        let hits = search(index, &query)?;
+        Ok(Self {
+            hits,
+            selected: 0,
+            page: 0,
+            total: 0,
+            filters: query.filters,
+            any,
+            page_size,
+            cursors: vec![None],
+            count: Some(count),
+            count_failed: false,
+        })
+    }
+
+    pub fn count_pending(&self) -> bool {
+        self.count.is_some()
+    }
+
+    pub fn count_failed(&self) -> bool {
+        self.count_failed
+    }
+
+    /// Actualiza el total si el recuento en segundo plano ya terminó.
+    pub fn poll_count(&mut self) -> bool {
+        let Some(mut job) = self.count.take() else {
+            return false;
+        };
+        match job.poll() {
+            Some(Ok(total)) => {
+                self.total = total;
+                true
+            }
+            Some(Err(_)) => {
+                self.count_failed = true;
+                true
+            }
+            None => {
+                self.count = Some(job);
+                false
+            }
+        }
     }
 
     pub fn down(&mut self, index: &Index) -> Result<()> {
@@ -121,6 +185,7 @@ impl Results {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     use jxcore::{IndexOptions, Op};
     use tempfile::TempDir;
@@ -180,6 +245,15 @@ mod tests {
         vec![Filter::new("value", Op::Exists, None::<String>, false)]
     }
 
+    fn wait_for_count(results: &mut Results) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while results.count_pending() {
+            assert!(Instant::now() < deadline, "el recuento no terminó");
+            results.poll_count();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn ids(results: &Results) -> Vec<i64> {
         results.hits.iter().map(|hit| hit.id).collect()
     }
@@ -214,6 +288,16 @@ mod tests {
             total: results.total,
             cursors: results.cursors.clone(),
         }
+    }
+
+    #[test]
+    fn streaming_count_shows_the_first_page_before_the_total() {
+        let (_dir, index) = indexed(8);
+        let mut results = Results::start(&index, filters(), false, 3).unwrap();
+        assert_eq!(ids(&results), vec![0, 1, 2]);
+        wait_for_count(&mut results);
+        assert_eq!(results.total, 8);
+        assert!(!results.count_failed());
     }
 
     #[test]
@@ -420,6 +504,10 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(error.to_string().contains("entre 1 y 10000"));
+            assert!(
+                Results::start(&index, filters(), false, page_size).is_err(),
+                "start debe validar el tamaño de página"
+            );
         }
         for page_size in [1, 10_000] {
             let results = Results::new(&index, filters(), false, page_size).unwrap();

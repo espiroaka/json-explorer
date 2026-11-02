@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -184,6 +185,28 @@ fn key() -> Result<KeyEvent> {
             Event::Key(key) if key.kind != KeyEventKind::Release => return Ok(key),
             Event::Resize(_, _) => return Ok(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)),
             _ => {}
+        }
+    }
+}
+
+/// Espera una tecla. Mientras el total se cuenta en segundo plano vuelve cada
+/// poco; `None` pide redibujar cuando el recuento termina.
+fn results_event(results: &mut Results) -> Result<Option<KeyEvent>> {
+    if !results.count_pending() {
+        return Ok(Some(key()?));
+    }
+    loop {
+        if event::poll(Duration::from_millis(120))? {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => return Ok(Some(key)),
+                Event::Resize(_, _) => {
+                    return Ok(Some(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)));
+                }
+                _ => continue,
+            }
+        }
+        if results.poll_count() {
+            return Ok(None);
         }
     }
 }
@@ -529,7 +552,7 @@ fn reload(
     any: bool,
     page_size: usize,
 ) -> Result<Results> {
-    let results = Results::new(&session.index, filters.to_vec(), any, page_size)?;
+    let results = Results::start(&session.index, filters.to_vec(), any, page_size)?;
     session.last = Some((filters.to_vec(), any));
     Ok(results)
 }
@@ -541,7 +564,7 @@ fn facet(
     props: &[String],
     filters: &[jxcore::Filter],
     any: bool,
-    total: u64,
+    total: Option<u64>,
 ) -> Result<Option<jxcore::Filter>> {
     let Some(property) = menu(
         "Valores frecuentes",
@@ -575,16 +598,14 @@ fn facet(
         .iter()
         .map(|group| format!("{}    {}", clip(&group.value, 52), fmt(group.count)))
         .collect();
-    let Some(pick) = menu(
-        &format!("Valores de {path}"),
-        &format!(
+    let subtitle = match total {
+        Some(total) => format!(
             "{} coincidencias; las que no tienen `{path}` no cuentan · Enter añade la condición",
             fmt(total)
         ),
-        &labels,
-        &mut 0,
-    )?
-    else {
+        None => format!("las que no tienen `{path}` no cuentan · Enter añade la condición"),
+    };
+    let Some(pick) = menu(&format!("Valores de {path}"), &subtitle, &labels, &mut 0)? else {
         return Ok(None);
     };
     Ok(Some(jxcore::Filter::new(
@@ -668,6 +689,7 @@ fn browse(shell: &mut Shell, filters: Vec<jxcore::Filter>, any: bool) -> Result<
     let mut filters = filters;
     let mut results = reload(session, &filters, any, page_size)?;
     loop {
+        results.poll_count();
         let height = body_height()?;
         let start = results.selected.saturating_sub(height - 1);
         let rows: Vec<_> = if results.hits.is_empty() {
@@ -692,20 +714,29 @@ fn browse(shell: &mut Shell, filters: Vec<jxcore::Filter>, any: bool) -> Result<
                 })
                 .collect()
         };
+        let total = if results.count_pending() {
+            "…".to_string()
+        } else if results.count_failed() {
+            "no disponible".to_string()
+        } else {
+            fmt(results.total)
+        };
         draw(
             "Coincidencias",
             &format!(
                 "{} · Resultado {} / {} · Página {} · {} filas por página",
                 condition_summary(&filters, any),
                 fmt(results.current_number()),
-                fmt(results.total),
+                total,
                 results.page + 1,
                 page_size
             ),
             &rows,
             "↑/↓ recorrer todas · Enter/→ ver objeto · +/a añadir · -/z quitar última · t valores frecuentes · ←/Esc menú · RePág/AvPág cambiar página",
         )?;
-        let event = key()?;
+        let Some(event) = results_event(&mut results)? else {
+            continue;
+        };
         let next = match browse_action(&event, any, filters.len()) {
             BrowseAction::Back => break,
             BrowseAction::AddBlocked => {
@@ -725,7 +756,9 @@ fn browse(shell: &mut Shell, filters: Vec<jxcore::Filter>, any: bool) -> Result<
                 Some(shortened)
             }
             BrowseAction::Facet => {
-                match facet(&session.index, &props, &filters, any, results.total)? {
+                let known_total =
+                    (!results.count_pending() && !results.count_failed()).then_some(results.total);
+                match facet(&session.index, &props, &filters, any, known_total)? {
                     Some(filter) if !any => Some(with_extra(&filters, filter)),
                     Some(_) => {
                         document("No se puede acotar", ANY_CONFLICT)?;

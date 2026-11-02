@@ -666,7 +666,7 @@ fn count_conn(conn: &Connection, q: &SearchQuery) -> Result<u64> {
     Ok(n.max(0) as u64)
 }
 
-const COUNT_CACHE_KB: i64 = 8_192;
+const SHARD_CACHE_KB: i64 = 8_192;
 
 pub struct CountJob {
     rx: mpsc::Receiver<Result<u64>>,
@@ -718,7 +718,7 @@ impl Index {
                         if stop.load(Ordering::Relaxed) {
                             bail!("recuento cancelado");
                         }
-                        let conn = open_db_ro_with(&dir.join(&file), COUNT_CACHE_KB)?;
+                        let conn = open_db_ro_with(&dir.join(&file), SHARD_CACHE_KB)?;
                         total += count_conn(&conn, &query)?;
                     }
                     Ok(total)
@@ -730,12 +730,54 @@ impl Index {
     }
 }
 
+/// Ejecuta `query` en cada fragmento a la vez, cada uno con su conexión de
+/// lectura propia, y devuelve los resultados en el orden de los fragmentos.
+/// Con un solo fragmento no se abren conexiones nuevas.
+fn over_shards<T: Send>(
+    index: &Index,
+    query: impl Fn(&Connection) -> Result<T> + Sync + Send,
+) -> Result<Vec<T>> {
+    let shards = index.shards();
+    if shards.len() < 2 {
+        return query(&shards[0]).map(|value| vec![value]);
+    }
+    let dir = &index.dir;
+    let files: Vec<&str> = index
+        .manifest
+        .shards
+        .iter()
+        .map(|shard| shard.file.as_str())
+        .collect();
+    let mut results = Vec::with_capacity(files.len());
+    let query = &query;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .iter()
+            .map(|file| {
+                scope.spawn(move || {
+                    let conn = open_db_ro_with(&dir.join(file), SHARD_CACHE_KB)?;
+                    query(&conn)
+                })
+            })
+            .collect();
+        for handle in handles {
+            results.push(
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("la consulta de un fragmento terminó de forma inesperada"))
+                    .and_then(std::convert::identity),
+            );
+        }
+    });
+    results.into_iter().collect()
+}
+
 pub fn search(index: &Index, q: &SearchQuery) -> Result<Vec<Hit>> {
     let limit = q.limit.clamp(1, 10_000);
     let limit_i = limit as i64;
     let mut out = Vec::new();
-    for conn in index.shards() {
-        out.extend(search_conn(conn, q, limit_i)?);
+    for hits in over_shards(index, |conn| search_conn(conn, q, limit_i))? {
+        out.extend(hits);
     }
     out.sort_by_key(|hit| hit.id);
     out.truncate(limit);
@@ -743,11 +785,9 @@ pub fn search(index: &Index, q: &SearchQuery) -> Result<Vec<Hit>> {
 }
 
 pub fn count(index: &Index, q: &SearchQuery) -> Result<u64> {
-    let mut total = 0u64;
-    for conn in index.shards() {
-        total += count_conn(conn, q)?;
-    }
-    Ok(total)
+    Ok(over_shards(index, |conn| count_conn(conn, q))?
+        .into_iter()
+        .sum())
 }
 
 pub struct Group {

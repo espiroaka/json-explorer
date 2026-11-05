@@ -58,14 +58,20 @@ mod platform {
 
 #[cfg(unix)]
 mod platform {
-    pub type Original = i32;
+    pub type Original = libc::c_int;
+
+    // `getpriority` y `setpriority` piden `id_t` (entero sin signo), no el `pid_t`
+    // con signo que devuelve `getpid`; `std::process::id` ya viene en ese formato.
+    fn who() -> libc::id_t {
+        std::process::id()
+    }
 
     #[allow(unsafe_code)]
     pub(super) fn lower() -> Original {
-        // SAFETY: getpid/getpriority/setpriority solo afectan a nuestro
-        // proceso; un fallo se ignora y restore() reintenta con el valor guardado.
+        // SAFETY: getpriority/setpriority solo afectan a nuestro proceso; un fallo
+        // se ignora y restore() reintenta con el valor guardado.
         unsafe {
-            let pid = libc::getpid();
+            let pid = who();
             let original = libc::getpriority(libc::PRIO_PROCESS, pid);
             libc::setpriority(libc::PRIO_PROCESS, pid, 10);
             original
@@ -76,7 +82,7 @@ mod platform {
     pub(super) fn restore(original: Original) {
         // SAFETY: idem.
         unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, libc::getpid(), original);
+            libc::setpriority(libc::PRIO_PROCESS, who(), original);
         }
     }
 }

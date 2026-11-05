@@ -1,61 +1,86 @@
 # json-explorer
 
-Explora JSON grandes sin cargar el documento completo en memoria. `jexplorer` es
-**exclusivamente interactivo**: abre una fuente, descubre propiedades, crea un índice
-SQLite repartido en varios fragmentos dentro de una carpeta y consulta los objetos
-leyendo sus posiciones en el JSON original.
-En una terminal muestra menús navegables con flechas; con entrada o salida
-redirigida conserva el shell textual para scripts.
-El JSON no se modifica ni se copia al indexarlo.
+[![CI](https://github.com/espiroaka/json-explorer/actions/workflows/ci.yml/badge.svg)](https://github.com/espiroaka/json-explorer/actions/workflows/ci.yml)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)
 
-## Interfaz con flechas
+> **TL;DR (English).** `jexplorer` explores multi-gigabyte JSON files without loading the
+> document into memory. It streams the file once, indexes the top-level objects into a
+> folder of sharded SQLite databases, and answers queries by reading each object back at
+> its byte offset in the original file. The JSON is never copied, reformatted or modified.
+> Arrow-key menus in a terminal, plus a textual shell for scripts.
+>
+> La documentación completa está en español más abajo.
 
-Ejecuta `jexplorer` o `jexplorer "C:\datos\datos.json"` en CMD:
+**json-explorer** explora JSON grandes sin cargar el documento completo en memoria.
+`jexplorer` abre una fuente, descubre propiedades, crea un índice SQLite repartido en
+varios fragmentos dentro de una carpeta y consulta los objetos leyendo sus posiciones en el
+JSON original. En una terminal muestra menús navegables con flechas; con entrada o salida
+redirigida conserva el shell textual para scripts. El JSON no se modifica ni se copia al
+indexarlo.
 
-- **↑ / ↓**: elige una acción o recorre todas las coincidencias de una búsqueda.
-- **Enter / →**: abre una acción o el objeto seleccionado del JSON.
-- **← / Esc**: vuelve atrás; desde el visor conserva la página y el resultado.
-- **RePág / AvPág**: cambia de página de resultados o desplaza el visor.
-- **Inicio / Fin**: extremos de la página actual; en el visor, inicio/final del objeto.
-- En la pantalla de coincidencias, **+/a** añade una condición, **-/z** quita la
-  última y **t** lista los valores más frecuentes de una propiedad entre ellas
-  (Enter sobre un valor lo convierte en condición).
-- En el visor, **r** alterna original/formateado y **e** exporta los bytes originales.
-- En los campos de texto, ← / → editan; Enter acepta y Esc cancela.
-- En el menú principal, Esc o `q` salen.
+## Índice
 
-Puedes buscar eligiendo propiedad, operador y valor, o escribir una consulta
-completa. El navegador muestra el total de coincidencias y carga **solo una página**
-de objetos cada vez; las flechas cruzan los límites de página automáticamente.
-El subtítulo recuerda las condiciones activas de la búsqueda.
-El visor no tiene el límite de 200 líneas del shell textual y ajusta las líneas
-al ancho de la terminal.
+- [Por qué y con qué compararlo](#por-qué-y-con-qué-compararlo)
+- [Instalación](#instalación)
+- [Inicio rápido](#inicio-rápido)
+- [Interfaz con flechas](#interfaz-con-flechas)
+- [Comandos del shell](#comandos-del-shell)
+  - [Dónde vive el índice](#dónde-vive-el-índice)
+  - [Indexación](#indexación)
+  - [Operadores y consultas](#operadores-y-consultas)
+- [Formatos de salida](#formatos-de-salida)
+- [Limitaciones](#limitaciones)
+- [Cómo está escrito este proyecto](#cómo-está-escrito-este-proyecto)
+- [Desarrollo y contribuciones](#desarrollo-y-contribuciones)
+- [Licencia](#licencia)
 
-Los menús incluyen apertura, indexación, índices guardados, propiedades,
-estadísticas, valores frecuentes, verificación y ajustes. **Comandos del shell**
-conserva las operaciones avanzadas; indexar y verificar muestran su salida textual y
-esperan Enter para volver al menú. Rehacer un índice requiere confirmación.
-**Última búsqueda** vuelve a cargar los resultados desde la primera página.
+## Por qué y con qué compararlo
 
-Abrir un JSON sigue sin indexarlo automáticamente. Usa **Indexar JSON** si no
-hay un índice válido. Los formatos `json`, `csv` y `tsv` afectan a los comandos
-del shell, no al navegador con flechas.
+Un JSON de varios gigabytes no cabe en la memoria de un parser clásico, y sin embargo es
+el formato en el que acaban muchos volcados de bases de datos, logs o datasets.
+`jexplorer` lo ataja con dos ideas:
+
+- **Escáner de streaming.** Recorre el objeto raíz en ventanas de 8 MB sin parsear el
+  documento entero y registra, por objeto, su clave, su `id` interno y el par
+  `(offset, length)` de sus bytes exactos.
+- **Índice fragmentado.** Las propiedades indexadas viven en varias bases SQLite (FTS5
+  incluido) dentro de una misma carpeta. La consulta recorre los fragmentos y devuelve
+  solo una página de resultados; cada objeto se lee del JSON cuando lo pides.
+
+Consecuencia práctica: indexar no duplica el fichero y consultar no depende de cuánto mida
+el JSON, sino de cuántos objetos devuelvas. El JSON original tiene que seguir disponible
+para leer, exportar y verificar.
+
+| | `jexplorer` | `jq` | Importar a una BD |
+| --- | --- | --- | --- |
+| Memoria con un JSON de 4 GB | Constante (ventanas de 8 MB) | Carga el documento entero | Depende del import |
+| Repetir consultas distintas | Índice persistente | Recorre el fichero en cada consulta | Sí, después de importarlo |
+| Conservar los bytes originales | Sí (`raw N`, `e N`) | Reformatea | Se pierden al normalizar |
+| Exploración interactiva | Menús con flechas | Tuberías | Cliente externo |
+| Rutas anidadas (`direccion.ciudad`) | No: solo primer nivel | Sí | Sí |
+
+`jq --stream` también puede recortar la memoria, a costa de consultas mucho menos
+legibles; aquí no hay que elegir entre ambas cosas.
+
+No compite con `jq` para transformar documentos, ni con una BD relacional para joins o
+datos anidados: está pensado para **preguntar muchas veces a un volcado plano que no cabe
+en RAM** sin duplicarlo.
 
 ## Instalación
 
-Requiere Rust 1.87 o superior y un linker de C (Visual Studio Build Tools o MinGW
-en Windows; toolchain de C en Linux/macOS). SQLite se compila embebido.
-Desde el repositorio:
+Requiere Rust 1.87 o superior y un linker de C (Visual Studio Build Tools o MinGW en
+Windows; toolchain de C en Linux/macOS). SQLite se compila embebido.
 
-```bat
-cargo build --release
-target\release\jexplorer.exe
+```bash
+cargo install --path crates/cli     # o: cargo build --release
 ```
 
-En Linux/macOS, el binario es `target/release/jexplorer`. Los ejemplos siguientes
-suponen que `jexplorer` está en el `PATH`; también puedes usar su ruta completa.
+El ejecutable es `target/release/jexplorer` (`target\release\jexplorer.exe` en Windows).
+Los ejemplos suponen que `jexplorer` está en el `PATH`; también puedes usar su ruta
+completa.
 
-## Inicio rápido (CMD de Windows)
+## Inicio rápido
 
 El documento debe tener un objeto raíz cuyas claves identifiquen los objetos:
 
@@ -66,7 +91,7 @@ El documento debe tener un objeto raíz cuyas claves identifiquen los objetos:
 }
 ```
 
-En CMD, inicia el shell vacío o abre directamente un JSON o la carpeta de un índice:
+Inicia el navegador vacío, o abre directamente un JSON o la carpeta de un índice:
 
 ```bat
 jexplorer
@@ -80,35 +105,119 @@ Sin argumentos muestra el menú principal; con entrada o salida redirigida,
 un banner y el shell textual. `--help` y `--version` funcionan sin fichero. **No existen subcomandos externos**:
 `jexplorer index ...`, `jexplorer search ...`, `jexplorer shell ...` y el argumento
 externo `--db` no son la interfaz; los comandos se escriben dentro de la sesión.
+Para teclearlos, entra en **Comandos del shell**.
 
-Para escribir estos comandos en una terminal, entra en **Comandos del shell**.
-Con entrada o salida redirigida se usa directamente el shell textual:
+Salida real de una sesión sobre un JSON de 4.000 objetos, con las líneas de progreso y el
+final de la lista de resultados recortados:
 
 ```text
-jx> abrir "C:\datos con espacios\datos.json"
-jx> props
-jx> index --fts --batch 50000
-jx> nombre = Antonio
-jx> nombre ~i ari
-jx> edad >= 30 & ciudad = Madrid
-jx> count ciudad = Madrid | ciudad = Toledo
-jx> limite 1
-jx> ciudad ?
-jx> n
+jx> abrir "C:\datos\clientes.json"
+propiedad     apariciones  tipos
+activo              1.000  bool
+apellidos           1.000  string
+cifras              1.000  array
+descripcion         1.000  null, string
+direccion           1.000  object
+edad                1.000  number
+estado              1.000  string
+nombre              1.000  string
+datos               1.000  array
+JSON: C:\datos\clientes.json
+Usa `index` para indexar todas las propiedades, o `index --fts` para añadir FTS.
+
+jx> index --all --jobs 2
+Indexando C:\datos\clientes.json
+      → %LOCALAPPDATA%\json-explorer\indexes\clientes-a1b2c3d4e5f60718
+Objetos indexados:  4.000
+Propiedades:        activo, apellidos, cifras, descripcion, direccion, edad, estado, nombre, datos
+Fragmentos:         2
+Tiempo:             0.1 s
+Tamaño del índice:  2.06 MB
+
+jx> nombre =i maria
+  1         68  id68                       nombre = María                               [14966 · 207 B]
+  2         85  id85                       nombre = María                               [18755 · 201 B]
+  3         97  id97                       nombre = María                               [21394 · 255 B]
+  4        109  id109                      nombre = María                               [24052 · 202 B]
+  …
+
+20 resultado(s) en 1 ms   `n` para más, `ver <n>` para abrir
+
 jx> ver 1
-jx> e 1 "C:\datos con espacios\objeto.json"
-jx> verify
+{
+  "activo": true,
+  "apellidos": "García López",
+  "cifras": [
+    2020,
+    2025
+  ],
+  "descripcion": null,
+  "direccion": {
+    "calle": "Calle 125",
+    "ciudad": "Toledo"
+  },
+  "edad": 58,
+  "estado": "pendiente",
+  "nombre": "María",
+  "datos": [
+    2.9,
+    0.1,
+    1.7
+  ]
+}
+
+jx> top estado 3
+valor         tipo         apariciones
+inactivo      string             1.048
+baja          string             1.013
+activo        string             1.000
+
+jx> count estado = activo
+1000
+
 jx> q
 ```
 
-Abrir un JSON **no lo indexa automáticamente**. Para encontrar su índice se miran,
-en este orden, el almacén de índices (ver **Dónde vive el índice**) y la carpeta local
-`FICHERO.json.jindex` junto al JSON. Si ninguno abre de forma válida, el JSON queda
-seleccionado y se indica usar `index`; `props` permite descubrir sus propiedades antes
-de indexarlo. Un índice de un formato antiguo, uno incompleto o un `.jindex` suelto
-del formato de un solo fichero muestran un error explicativo y conservan la sesión
-anterior. Una apertura válida borra los resultados y la última consulta de la fuente
-anterior.
+Abrir un JSON **no lo indexa automáticamente**. Para encontrar su índice se miran, en este
+orden, el almacén de índices (ver
+[Dónde vive el índice](#dónde-vive-el-índice)) y la carpeta local `FICHERO.json.jindex`
+junto al JSON. Si ninguno abre de forma válida, el JSON queda seleccionado y se indica usar
+`index`; `props` permite descubrir sus propiedades antes de indexarlo. Un índice de un
+formato antiguo, uno incompleto o un `.jindex` suelto del formato de un solo fichero muestran
+un error explicativo y conservan la sesión anterior. Una apertura válida borra los resultados
+y la última consulta de la fuente anterior.
+
+## Interfaz con flechas
+
+Ejecuta `jexplorer` o `jexplorer "C:\datos\datos.json"`:
+
+- **↑ / ↓**: elige una acción o recorre todas las coincidencias de una búsqueda.
+- **Enter / →**: abre una acción o el objeto seleccionado del JSON.
+- **← / Esc**: vuelve atrás; desde el visor conserva la página y el resultado.
+- **RePág / AvPág**: cambia de página de resultados o desplaza el visor.
+- **Inicio / Fin**: extremos de la página actual; en el visor, inicio/final del objeto.
+- En la pantalla de coincidencias, **+/a** añade una condición, **-/z** quita la última y
+  **t** lista los valores más frecuentes de una propiedad entre ellas (Enter sobre un valor
+  lo convierte en condición).
+- En el visor, **r** alterna original/formateado y **e** exporta los bytes originales.
+- En los campos de texto, ← / → editan; Enter acepta y Esc cancela.
+- En el menú principal, Esc o `q` salen.
+
+Puedes buscar eligiendo propiedad, operador y valor, o escribir una consulta completa. El
+navegador muestra el total de coincidencias y carga **solo una página** de objetos cada
+vez; las flechas cruzan los límites de página automáticamente. El subtítulo recuerda las
+condiciones activas de la búsqueda. El visor no tiene el límite de 200 líneas del shell
+textual y ajusta las líneas al ancho de la terminal.
+
+Los menús incluyen apertura, indexación, índices guardados, propiedades, estadísticas,
+valores frecuentes, verificación y ajustes. **Comandos del shell** conserva las
+operaciones avanzadas; indexar y verificar muestran su salida textual y esperan Enter para
+volver al menú. Rehacer un índice requiere confirmación. **Última búsqueda** vuelve a
+cargar los resultados desde la primera página.
+
+Abrir un JSON sigue sin indexarlo automáticamente. Usa **Indexar JSON** si no hay un índice
+válido. Los formatos `json`, `csv` y `tsv` afectan a los comandos del shell, no al navegador
+con flechas.
 
 ## Comandos del shell
 
@@ -180,7 +289,7 @@ index --force --all --fts
 
 - `--select PROP` es repetible y limita las propiedades; `--all` las incluye todas.
 - `--fts` añade FTS5 con tokenizador trigram para búsquedas de texto.
-- `--batch N` establece los objetos por transacción; debe ser positivo.
+- `--batch N` establece los objetos por transacción; entre 1 y 1.000.000.
 - `--jobs N` fija cuántos fragmentos se escriben (1 a 64); se indexan en paralelo.
 - `--cpus N` limita a N los núcleos que puede usar la construcción (0, por defecto, usa
   todos): se ajustan los fragmentos y los hilos de índice para no pasar de ese número.
@@ -192,8 +301,8 @@ index --force --all --fts
   mismas opciones: `indices rehacer 2 --cpus 4 --low-priority`. En el menú **Índices
   guardados**, «Rehacer gastando menos CPU» escribe ese comando por ti.
 - `--db CARPETA` elige dónde se guarda el índice; la crea si falta y, sin esa opción,
-  se usa el almacén (ver **Dónde vive el índice**). Rehacer un índice abierto conserva
-  su ruta.
+  se usa el almacén (ver [Dónde vive el índice](#dónde-vive-el-índice)). Rehacer un índice
+  abierto conserva su ruta.
 - **Precaución con `--force`: rehace el índice desde cero.** Revisa su ruta y las
   propiedades/FTS deseadas antes de usarlo. No modifica el JSON, pero sustituye
   el índice anterior; es necesario cuando el índice es de un formato antiguo, y
@@ -210,6 +319,11 @@ index --force --all --fts
 | `?` / `!?` | Existe / falta la propiedad | `dato !?` |
 | `null` | Existe y vale null; no equivale a ausencia | `dato null` |
 | `~r` | Expresión regular sobre el valor almacenado | `nombre ~r "^Ant(o\|ó)"` |
+
+Cada operador acepta también su nombre —`igual`, `distinto`, `contiene`, `empieza`,
+`mayor`, `mayor_igual`, `menor`, `menor_igual`, `existe`, `falta`, `null`, `regex`, más los
+equivalentes en inglés `eq`, `ne`, `contains`, `prefix`, `gt`, `gte`, `lt`, `lte`, `exists`,
+`missing`—: `nombre igual Antonio` y `nombre = Antonio` son la misma consulta.
 
 ```text
 edad > 30 & ciudad = Toledo
@@ -258,7 +372,26 @@ leer, exportar y verificar los objetos.
 - Si cambia el JSON, el índice puede dejar de ser válido; verificar no actualiza
   el índice. No se garantiza actualización incremental de un JSON modificado.
 
-## Desarrollo
+## Cómo está escrito este proyecto
+
+Este repositorio es **full vibe coded**. Todo lo que hay dentro —`crates/core`,
+`crates/cli`, sus pruebas, el CI y esta documentación— lo han escrito agentes de IA a
+partir de especificaciones, reproches y decisiones de diseño del maintainer, que revisa
+diffs en lugar de teclear funciones.
+
+Se avisa aquí porque cambia lo que puedes esperar:
+
+- La **suite de pruebas y `verify` son la red de seguridad**, no la memoria de un autor:
+  hay comportamientos que nadie «recuerda» y que solo sostienen los tests.
+- El código optimiza lo que se pidió medir, no lo que suena a buena práctica: ficheros
+  grandes, dependencias mínimas y casi ningún comentario.
+- Reportar un bug sigue mereciendo la pena: un issue con un JSON que reproduzca el fallo es
+  la mejor especificación que un agente puede recibir, y se cierra igual de rápido.
+
+El flujo concreto —qué se comprueba antes de un merge y cómo se propone un cambio— está en
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Desarrollo y contribuciones
 
 ```bash
 cargo fmt --all
@@ -267,7 +400,12 @@ cargo test --workspace
 ```
 
 `crates/core` contiene scanner, parser, índice y búsquedas; `crates/cli` contiene
-el shell y sus pruebas de integración.
+el shell y sus pruebas de integración. El CI comprueba formato, clippy con `-D warnings` y
+la suite en Linux, Windows y macOS.
+
+Las contribuciones son bienvenidas: abre un issue antes de cualquier cambio de
+comportamiento y pasa fmt, clippy y test en local antes de empujar. Ver
+[`CONTRIBUTING.md`](CONTRIBUTING.md) y [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Licencia
 

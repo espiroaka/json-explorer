@@ -1,0 +1,45 @@
+name: Propuesta
+description: Nueva función, nuevo operador o cambio de comportamiento
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problema
+    attributes:
+      label: Qué no puedes hacer hoy
+      description: >-
+        El caso de uso concreto, no la solución. «Necesito filtrar por …» y no
+        «haced un flag --foo».
+      placeholder: |
+        Con un volcado de varios gigabytes quiero …, y hoy tengo que …
+    validations:
+      required: true
+
+  - type: textarea
+    id: interfaz
+    attributes:
+      label: Cómo lo imaginas
+      description: >-
+        Comandos, salidas o atajos de teclado de ejemplo. El detalle se ajusta en la
+        discusión.
+      render: text
+      placeholder: |
+        jx> direccion.ciudad = Toledo
+        jx> index --nested
+
+  - type: textarea
+    id: alternativas
+    attributes:
+      label: Qué has probado ya
+      description: Con `--select`, `--fts`, `~r`, `top`, `count` o exportando a otro formato
+        casi siempre se resuelve sin tocar código.
+
+  - type: checkboxes
+    id: alcance
+    attributes:
+      label: Sabe que esto puede cambiar el formato del índice
+      options:
+        - label: >-
+            Entiendo que un cambio de esquema obliga a rehacer los índices con
+            "index --force", y que el formato antiguo se detecta al abrirlo en vez de
+            migrarse en silencio.
+          required: true

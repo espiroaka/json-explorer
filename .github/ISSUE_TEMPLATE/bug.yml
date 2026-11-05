@@ -1,0 +1,69 @@
+name: Informe de fallo
+description: Algo que no hace lo que promete el README
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Antes de nada, `jexplorer --version`. Si el índice es de antes de 0.2.0, rehazlo con
+        `index --force --all` y confirma que el fallo persiste.
+  - type: input
+    id: version
+    attributes:
+      label: Versión
+      placeholder: jexplorer 0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Sistema operativo
+      options: [Windows, Linux, macOS]
+    validations:
+      required: true
+
+  - type: textarea
+    id: datos
+    attributes:
+      label: Datos
+      description: Tamaño del JSON, nº de objetos y forma de un objeto (pega uno de ejemplo).
+      value: |
+        Tamaño:
+        Objetos:
+        Propiedades implicadas:
+        Un objeto de ejemplo:
+        ```json
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Cómo reproducirlo
+      description: Los comandos exactos, tal cual los escribiste (navegador o shell).
+      render: text
+      placeholder: |
+        jx> abrir "C:\datos\clientes.json"
+        jx> index --all --fts
+        jx> nombre ~i ari
+    validations:
+      required: true
+
+  - type: textarea
+    id: esperado
+    attributes:
+      label: Qué esperabas y qué salió
+      description: Incluye el mensaje de error literal si lo hubo.
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Contexto
+      description: |
+        `stats`, `verify`, si el JSON cambió desde indexarlo, si el fichero está en red o en
+        un disco externo. Un recorte de 200 objetos que reproduzca el fallo vale más que
+        cualquier descripción.

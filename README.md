@@ -23,6 +23,7 @@ indexarlo.
 
 - [Por qué y con qué compararlo](#por-qué-y-con-qué-compararlo)
 - [Instalación](#instalación)
+  - [Descargas](#descargas)
 - [Inicio rápido](#inicio-rápido)
 - [Interfaz con flechas](#interfaz-con-flechas)
 - [Comandos del shell](#comandos-del-shell)
@@ -79,6 +80,27 @@ cargo install --path crates/cli     # o: cargo build --release
 El ejecutable es `target/release/jexplorer` (`target\release\jexplorer.exe` en Windows).
 Los ejemplos suponen que `jexplorer` está en el `PATH`; también puedes usar su ruta
 completa.
+
+### Descargas
+
+[Releases](https://github.com/espiroaka/json-explorer/releases) publica por cada etiqueta un
+binario por plataforma (`jexplorer-<versión>-windows-x64.exe`, `...-linux-x64` y
+`...-macos-arm64`) junto a un `SHA256SUMS.txt` con las tres sumas. El `.exe` lleva la CRT de
+Visual Studio embebida, así que no necesita el redistribuible; los de Linux y macOS piden
+`chmod +x` después de bajarlos y ninguno está firmado, así que Windows puede avisar la
+primera vez.
+
+Para comprobar la descarga, quédate solo con la línea del fichero que tienes:
+
+```powershell
+$esperada = (Select-String 'windows-x64' SHA256SUMS.txt).Line.Split(" ")[0]
+(Get-FileHash .\jexplorer-0.2.0-windows-x64.exe).Hash.ToLower() -eq $esperada
+```
+
+```bash
+grep linux-x64 SHA256SUMS.txt | sha256sum -c -        # Linux
+grep macos-arm64 SHA256SUMS.txt | shasum -a 256 -c -  # macOS
+```
 
 ## Inicio rápido
 
@@ -401,7 +423,9 @@ cargo test --workspace
 
 `crates/core` contiene scanner, parser, índice y búsquedas; `crates/cli` contiene
 el shell y sus pruebas de integración. El CI comprueba formato, clippy con `-D warnings` y
-la suite en Linux, Windows y macOS.
+la suite en Linux, Windows y macOS. Empujar una etiqueta `v*` activa
+[`.github/workflows/release.yml`](.github/workflows/release.yml), que compila un binario por
+plataforma y publica la release con sus checksums.
 
 Las contribuciones son bienvenidas: abre un issue antes de cualquier cambio de
 comportamiento y pasa fmt, clippy y test en local antes de empujar. Ver

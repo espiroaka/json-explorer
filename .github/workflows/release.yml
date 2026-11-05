@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: windows-x64
+            built: jexplorer.exe
+            suffix: .exe
+            # Sin esto el .exe pide el redistribuible de MSVC en máquinas limpias.
+            rustflags: -C target-feature=+crt-static
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: linux-x64
+            built: jexplorer
+            suffix: ""
+            rustflags: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+            suffix: ""
+            built: jexplorer
+            rustflags: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+      - name: Preparar el binario
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          mv "target/${{ matrix.target }}/release/${{ matrix.built }}" \
+             "dist/jexplorer-${version}-${{ matrix.asset }}${{ matrix.suffix }}"
+          "dist/jexplorer-${version}-${{ matrix.asset }}${{ matrix.suffix }}" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist
+          if-no-files-found: error
+
+  release:
+    name: Publicar la release
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Sumas de verificación y notas
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mv assets dist
+          cd dist
+          sha256sum jexplorer-* > SHA256SUMS.txt
+          cd ..
+          {
+            printf 'Binarios de json-explorer %s. Comprueba la descarga con `SHA256SUMS.txt`.\n\n' "$version"
+            printf 'Sin binario: `cargo install --path crates/cli` (Rust 1.87+).\n\n'
+            printf 'Los binarios no van firmados; Windows puede avisar la primera vez.\n'
+            printf 'En Linux y macOS hace falta `chmod +x` tras descargar.\n\n'
+            awk -v want="## [$version]" 'index($0, want)==1 {p=1; next} p && /^## / {exit} p' CHANGELOG.md
+          } > notas.md
+          cat notas.md
+      - name: Crear la release
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "json-explorer $version" \
+            --notes-file notas.md \
+            dist/*
+          gh release view "$GITHUB_REF_NAME" --json tagName,assets --jq '.tagName, (.assets[].name)'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

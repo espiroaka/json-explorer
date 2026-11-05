@@ -6,10 +6,9 @@ Formato [Keep a Changelog](https://keepachangelog.com/es/1.1.0/); versionado
 
 ## [Sin publicar]
 
-Nada aparte de lo que ya está en `0.2.0`: esa versión es la del `master` actual y todavía no
-tiene tag ni publicación.
+Nada todavía.
 
-## [0.2.0] — sin etiquetar (versión actual)
+## [0.2.0] — 2026-11-05
 
 Reescritura de la interfaz, del almacenamiento del índice y del camino de consulta.
 

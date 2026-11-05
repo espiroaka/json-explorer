@@ -116,12 +116,12 @@ propiedad     apariciones  tipos
 activo              1.000  bool
 apellidos           1.000  string
 cifras              1.000  array
+datos               1.000  array
 descripcion         1.000  null, string
 direccion           1.000  object
 edad                1.000  number
 estado              1.000  string
 nombre              1.000  string
-datos               1.000  array
 JSON: C:\datos\clientes.json
 Usa `index` para indexar todas las propiedades, o `index --fts` para añadir FTS.
 
@@ -129,7 +129,7 @@ jx> index --all --jobs 2
 Indexando C:\datos\clientes.json
       → %LOCALAPPDATA%\json-explorer\indexes\clientes-a1b2c3d4e5f60718
 Objetos indexados:  4.000
-Propiedades:        activo, apellidos, cifras, descripcion, direccion, edad, estado, nombre, datos
+Propiedades:        activo, apellidos, cifras, datos, descripcion, direccion, edad, estado, nombre
 Fragmentos:         2
 Tiempo:             0.1 s
 Tamaño del índice:  2.06 MB
@@ -151,6 +151,11 @@ jx> ver 1
     2020,
     2025
   ],
+  "datos": [
+    2.9,
+    0.1,
+    1.7
+  ],
   "descripcion": null,
   "direccion": {
     "calle": "Calle 125",
@@ -158,12 +163,7 @@ jx> ver 1
   },
   "edad": 58,
   "estado": "pendiente",
-  "nombre": "María",
-  "datos": [
-    2.9,
-    0.1,
-    1.7
-  ]
+  "nombre": "María"
 }
 
 jx> top estado 3
